@@ -8,6 +8,18 @@ Reduce el consumo de tokens aplicando varias técnicas de optimización de forma
 
 ---
 
+## 📚 Documentación
+
+| Documento | Contenido |
+|-----------|-----------|
+| **[docs/architecture.md](docs/architecture.md)** | Cómo funcionan las 7 técnicas de optimización y el flujo interno de una petición |
+| **[docs/deployment.md](docs/deployment.md)** | Despliegue con PM2, Docker y Kubernetes; reverse proxy y escalado |
+| **[docs/contributing.md](docs/contributing.md)** | Cómo añadir una técnica nueva, convenciones y tests |
+
+Este README cubre instalación, configuración, endpoints y operación básica.
+
+---
+
 ## 🚀 Características
 
 | Técnica | Descripción | Estado |
@@ -334,6 +346,10 @@ Verifica que la carpeta `public/` se haya creado automáticamente en el director
 ├── test/
 │   ├── optimizer.test.js            # Tests unitarios de la lógica pura
 │   └── server.integration.test.js   # Tests de integración HTTP (SDK mockeado, sin red)
+├── docs/
+│   ├── architecture.md     # Las 7 técnicas y el flujo interno
+│   ├── deployment.md       # PM2, Docker, Kubernetes
+│   └── contributing.md     # Cómo añadir técnicas + convenciones
 ├── public/
 │   └── dashboard.html      # Panel de control (auto-generado)
 ├── cache.json              # Persistencia de caché + métricas (auto-generado)
@@ -348,30 +364,14 @@ Ejecuta los tests con `npm test` (usa el runner nativo de Node, sin dependencias
 
 ## 🔧 Despliegue en producción
 
-### Con PM2
+Guía completa con PM2, Docker y Kubernetes (Dockerfile con `dumb-init` y healthcheck, manifiestos de K8s, reverse proxy nginx, escalado y estado compartido) en **[docs/deployment.md](docs/deployment.md)**.
+
+Lo mínimo con PM2:
 
 ```bash
-npm install -g pm2
-pm2 start server.js --name token-optimizer
-pm2 save
-pm2 startup
-```
-
-### Con Docker
-
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY server.js .
-EXPOSE 8080
-CMD ["node", "server.js"]
-```
-
-```bash
-docker build -t token-optimizer .
-docker run -d -p 8080:8080 -e ANTHROPIC_API_KEY="sk-ant-..." token-optimizer
+npm ci --omit=dev
+NODE_ENV=production pm2 start server.js --name token-optimizer
+pm2 save && pm2 startup
 ```
 
 ---
