@@ -13,9 +13,9 @@ Reduce el consumo de tokens aplicando varias técnicas de optimización de forma
 | Técnica | Descripción | Estado |
 |---------|-------------|:------:|
 | **Streaming (SSE)** | Passthrough de `stream: true` reenviando eventos SSE | ✅ Activo |
-| **Asymmetric Cache Breakpoints** | `cache_control` en el prefijo estable (tools + system + penúltimo mensaje) | ✅ Activo |
+| **Asymmetric Cache Breakpoints** | `cache_control` en el prefijo estable (tools + system + penúltimo mensaje). **Si el cliente ya trae sus propios breakpoints (p. ej. Claude Code), se respetan y no se tocan** | ✅ Activo |
 | **Dynamic Max Tokens** | Ajusta `max_tokens` según la intención; nunca por encima de lo que pide el cliente y sin truncar bucles de herramientas | ✅ Activo |
-| **Compresión de Historial** | Resume conversaciones largas con Haiku y reutiliza el resumen en caché | ✅ Activo |
+| **Compresión de Historial** | Resume conversaciones largas con Haiku **en background** (cero latencia añadida: el resumen se aplica a partir de la siguiente petición) y lo reutiliza en caché | ✅ Activo |
 | **Prefill Detection** | Inyecta un mensaje `assistant` de prefijo (`{`, `-`, ` ``` `); desactivado en bucles de tools **y en modelos que lo rechazan** (Fable 5 y familia 4.6+) | ✅ Activo |
 | **Batch de Tareas** | Fusiona hasta 8 prompts independientes en una llamada (manual + automático) | ✅ Activo |
 | **Saneamiento por modelo** | Elimina automáticamente parámetros que la API rechazaría con 400 según el modelo: `thinking: disabled` en Fable 5, `temperature`/`top_p`/`top_k` en Fable 5 / Opus 4.7+/ Sonnet 5, prefill en la familia 4.6+ | ✅ Activo |
@@ -30,7 +30,7 @@ Reduce el consumo de tokens aplicando varias técnicas de optimización de forma
 
 ### Requisitos previos
 
-- **Node.js** 18 o superior
+- **Node.js** 20 o superior
 - **API Key de Anthropic** con acceso a los modelos deseados
 
 ### Paso a paso
@@ -273,7 +273,7 @@ En el **apagado ordenado** deja de aceptar nuevas peticiones (responde `503`), r
 - **Rate limiting** en las rutas `/v1/*`, **por API key** (con la IP como respaldo). Al superar el límite se devuelve `429` con cabeceras `RateLimit-*`. Configurable con `RATE_LIMIT_MAX` y `RATE_LIMIT_WINDOW_MS`.
 - **Timeout/abort** hacia Anthropic (`REQUEST_TIMEOUT_MS`): una petición colgada no bloquea recursos; si el cliente se desconecta, se aborta la llamada upstream.
 - **Logging estructurado** con [pino](https://getpino.io) + `pino-http`: un log JSON por petición con `request-id`, latencia y estado. La `x-api-key` y el `Authorization` se **redactan** siempre. En desarrollo la salida es legible; con `NODE_ENV=production` es JSON (apto para Docker/PM2/agregadores).
-- **Métrica de ahorro** (`totalTokensSaved`): suma el ahorro **real** por caché de prefijo (≈90% de `cache_read_input_tokens`, dato que devuelve la API) más el delta real de la compresión de historial. Sigue siendo orientativa, pero ya no es un porcentaje inventado sobre el total de entrada.
+- **Métrica de ahorro** (`totalTokensSaved` + `totalSavingsUSD`): suma el ahorro **real** por caché de prefijo (≈90% de `cache_read_input_tokens`, dato que devuelve la API) más el delta real de la compresión de historial. El valor en USD se calcula con el **precio de entrada real de cada modelo** (Fable $10/M, Opus $5/M, Sonnet $3/M, Haiku $1/M), no con una tarifa fija.
 
 ---
 
@@ -309,7 +309,7 @@ echo $ANTHROPIC_API_KEY
 El proxy reintenta automáticamente la petición eliminando todos los `cache_control` (de system, mensajes y tools). Si persiste, verifica que tu modelo soporte Prompt Caching.
 
 **La compresión no se activa**
-Se dispara cuando hay 10 o más mensajes en el historial. El resumen se cachea por `x-conversation-id` (o, si no lo envías, por un hash del primer mensaje) y se **refresca** cuando la conversación crece otros 10 mensajes. Para forzar/compartir caché entre peticiones, envía tú mismo `x-conversation-id`. Para desactivarla puntualmente, usa `x-skip-compression`.
+Se dispara cuando hay 10 o más mensajes en el historial y es **asíncrona**: la primera petición que supera el umbral lanza la compresión en background y el resumen se aplica **a partir de la siguiente petición** (así nunca añade latencia). El resumen se cachea por `x-conversation-id` (o, si no lo envías, por un hash del primer mensaje), aislado por API key, y se **refresca** cuando la conversación crece otros 10 mensajes. Para forzar/compartir caché entre peticiones, envía tú mismo `x-conversation-id`. Para desactivarla puntualmente, usa `x-skip-compression`.
 
 **Un agente se rompe / responde raro**
 Asegúrate de **no** activar `x-tool-pruning` ni `x-anti-preamble`: modifican herramientas y comportamiento del modelo y están pensados para usos concretos, no para agentes como Claude Code.
@@ -419,6 +419,17 @@ Basado en pruebas internas con conversaciones de desarrollo típicas (50–100 t
 **Bugs:**
 
 - `calculateMaxTokens` truncaba a 30 tokens cualquier mensaje que contuviera "ok" como **subcadena** ("look", "token", "broker"...). Ahora usa límites de palabra.
+- `calculateMaxTokens` también truncaba mensajes largos que empezaran por "no"/"sí" ("no entiendo este código, explícamelo..."); el modo respuesta-corta solo aplica ya a mensajes de menos de 25 caracteres.
+
+**Rendimiento y ahorro (v3.3.x):**
+
+- **Compresión asíncrona:** la llamada a Haiku salió del camino crítico — se lanza en background y el resumen se aplica desde la siguiente petición. Antes, la primera petición que superaba el umbral pagaba la latencia completa del resumen.
+- **Respeto a los breakpoints del cliente:** si la petición ya trae `cache_control` (Claude Code los coloca cuidadosamente), el proxy no los reubica — reubicarlos invalidaba el prefijo que el cliente ya tenía cacheado y costaba una reescritura de caché.
+- **Ahorro USD por modelo real:** `totalSavingsUSD` valora cada token ahorrado al precio de entrada del modelo usado (Fable $10/M, Opus $5/M, Sonnet $3/M, Haiku $1/M) en vez de $3/M fijo.
+- La compresión no lanza dos llamadas simultáneas para la misma conversación (dedupe en vuelo) y `temperature` solo se envía al compresor si su modelo la acepta.
+- Evicción del cliente más antiguo en la caché de clientes SDK (antes se vaciaba entera al llegar al límite).
+- Apagado ordenado real: espera a que terminen las respuestas en vuelo (hasta 5 s) y cierra las conexiones keep-alive ociosas, en vez de salir a los 250 ms.
+- `engines`: Node ≥ 20 (18 está fuera de soporte).
 
 ---
 

@@ -278,6 +278,64 @@ test('messages no-array -> 400 sin llamar al SDK', async () => {
   assert.equal(state.calls.length, 0);
 });
 
+test('cache_control del cliente se respeta: el proxy no reubica breakpoints', async () => {
+  const res = await request('POST', '/v1/messages', {
+    headers: { 'x-api-key': 'k-client-cache' },
+    body: {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      system: [{ type: 'text', text: 'prompt del cliente', cache_control: { type: 'ephemeral' } }],
+      messages: [
+        { role: 'user', content: 'uno' },
+        { role: 'assistant', content: 'dos' },
+        { role: 'user', content: 'analiza el proyecto con mucho detalle por favor' },
+      ],
+      tools: [{ name: 'a', description: 'tool a', input_schema: { type: 'object' } }],
+    },
+  });
+  assert.equal(res.status, 200);
+  const body = lastCall().body;
+  // system intacto (un solo bloque, su breakpoint original)
+  assert.equal(body.system.length, 1);
+  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral' });
+  // el proxy NO añadió breakpoints propios ni a tools ni a mensajes
+  assert.equal(body.tools[0].cache_control, undefined);
+  assert.equal(typeof body.messages[1].content, 'string'); // penúltimo msg sin tocar
+});
+
+test('compresión asíncrona: no bloquea la 1ª petición y se aplica en la 2ª', async () => {
+  // Historial de 10 mensajes (umbral de compresión), mismo primer mensaje => mismo convId.
+  const msgs = [];
+  for (let i = 0; i < 5; i++) {
+    msgs.push({ role: 'user', content: 'pregunta número ' + i + ' con suficiente contenido' });
+    msgs.push({ role: 'assistant', content: 'respuesta número ' + i });
+  }
+  state.createImpl = async (body) => {
+    // La llamada de compresión usa el modelo compresor (haiku): devuelve el resumen.
+    if (/haiku/.test(body.model)) {
+      return { id: 'msg_sum', content: [{ type: 'text', text: 'RESUMEN-ASYNC' }], usage: {} };
+    }
+    return { id: 'msg_main', content: [{ type: 'text', text: 'ok' }], usage: {} };
+  };
+
+  const body = { model: 'claude-sonnet-4-6', max_tokens: 1000, messages: msgs };
+  const res1 = await request('POST', '/v1/messages', { headers: { 'x-api-key': 'k-compress' }, body });
+  assert.equal(res1.status, 200);
+  // 1ª petición: la compresión corre en background, NO se aplica todavía.
+  assert.equal(res1.headers['x-compressed'], undefined);
+
+  // Esperamos a que termine la compresión en background.
+  await new Promise(r => setTimeout(r, 80));
+
+  const res2 = await request('POST', '/v1/messages', { headers: { 'x-api-key': 'k-compress' }, body });
+  assert.equal(res2.status, 200);
+  assert.equal(res2.headers['x-compressed'], 'true');
+  // El historial enviado a Anthropic incluye el resumen y menos mensajes.
+  const sent = lastCall().body;
+  assert.match(JSON.stringify(sent.messages[0]), /RESUMEN-ASYNC/);
+  assert.ok(sent.messages.length < msgs.length);
+});
+
 test('petición sin system no revienta (regresión deepClone) y llega al SDK', async () => {
   const res = await request('POST', '/v1/messages', {
     headers: { 'x-api-key': 'k-nosystem' },

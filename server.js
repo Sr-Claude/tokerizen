@@ -20,6 +20,8 @@ const {
   isFable5Model,
   supportsPrefill,
   supportsSampling,
+  modelInputPricePerMTok,
+  hasClientCacheControl,
   generateConvId,
   extractLastUserText,
   hasRecentToolResult,
@@ -89,7 +91,9 @@ function makeClient(apiKey) {
   const key = apiKey || '';
   let client = clientCache.get(key);
   if (!client) {
-    if (clientCache.size >= 100) clientCache.clear();
+    // Evicción del más antiguo (el Map conserva orden de inserción) en vez de
+    // vaciar toda la caché de clientes de golpe.
+    if (clientCache.size >= 100) clientCache.delete(clientCache.keys().next().value);
     client = new Anthropic({ apiKey, timeout: CONFIG.REQUEST_TIMEOUT_MS, maxRetries: CONFIG.MAX_RETRIES });
     clientCache.set(key, client);
   }
@@ -103,11 +107,20 @@ function tokensSavedFromUsage(usage) {
   return Math.floor((usage.cache_read_input_tokens || 0) * 0.9);
 }
 
+// Acumula tokens ahorrados Y su valor en USD según el precio de entrada real
+// del modelo (Fable $10/M, Opus $5/M, Sonnet $3/M, Haiku $1/M).
+function addSavedTokens(tokens, model) {
+  if (!tokens || tokens <= 0) return;
+  metrics.totalTokensSaved += tokens;
+  metrics.totalSavingsUSD = (metrics.totalSavingsUSD || 0) + (tokens * modelInputPricePerMTok(model)) / 1e6;
+}
+
 // ==================== PERSISTENCIA ====================
 let conversationCache = new Map();
 let metrics = {
   totalRequests: 0,
   totalTokensSaved: 0,
+  totalSavingsUSD: 0,
   totalBatchCalls: 0,
   totalCompressions: 0,
   startTime: Date.now(),
@@ -150,7 +163,10 @@ setInterval(() => {
 }, 60_000).unref();
 
 // ==================== COMPRESIÓN (parte impura) ====================
-async function compressHistory(messages, system, convId, apiKey, signal) {
+// Evita lanzar dos compresiones simultáneas para la misma conversación.
+const compressionsInFlight = new Set();
+
+async function compressHistory(messages, system, convId, apiKey, requestModel, signal) {
   const turns = messages.filter(m => m.role === 'user' || m.role === 'assistant');
   const conversationText = turns.map(m => {
     const role = m.role === 'user' ? 'User' : 'Assistant';
@@ -165,7 +181,8 @@ async function compressHistory(messages, system, convId, apiKey, signal) {
     const resp = await client.messages.create({
       model: CONFIG.COMPRESSION_MODEL,
       max_tokens: CONFIG.COMPRESSION_MAX_TOKENS,
-      temperature: 0,
+      // temperature solo donde la API la acepta (por si COMPRESSION_MODEL es un modelo moderno).
+      ...(supportsSampling(CONFIG.COMPRESSION_MODEL) ? { temperature: 0 } : {}),
       system: 'Summarize the following conversation. Preserve ALL decisions, code snippets, file paths, commands executed, key facts, and pending tasks. Omit greetings, apologies, and filler. Use Spanish if the conversation is in Spanish.',
       messages: [{ role: 'user', content: conversationText }],
     }, { signal });
@@ -181,7 +198,8 @@ async function compressHistory(messages, system, convId, apiKey, signal) {
       msgCount: messages.length,
     });
     metrics.totalCompressions++;
-    metrics.totalTokensSaved += Math.max(0, beforeTokens - afterTokens);
+    // El ahorro se valora al precio del modelo de la conversación (no del compresor).
+    addSavedTokens(Math.max(0, beforeTokens - afterTokens), requestModel);
 
     logger.info({ convId, savedTokens: beforeTokens - afterTokens }, 'historial comprimido');
     return { convId, summary };
@@ -221,7 +239,7 @@ async function processBatch(tasks, system, apiKey, options = {}) {
 
   metrics.totalBatchCalls++;
   const sysTokens = estimateTokens(typeof system === 'string' ? system : JSON.stringify(system || ''));
-  metrics.totalTokensSaved += sysTokens * Math.max(0, tasks.length - 1);
+  addSavedTokens(sysTokens * Math.max(0, tasks.length - 1), model);
 
   return parsed.length ? parsed.map(c => ({ content: c })) : [{ content: text, warning: 'Batch parsing failed' }];
 }
@@ -298,12 +316,20 @@ app.post('/v1/messages', async (req, res) => {
     // TÉCNICA 3: Dynamic Max Tokens (respeta el del cliente y los bucles de tools)
     body.max_tokens = calculateMaxTokens(messages, body.tools, clientMaxTokens, model);
 
-    // TÉCNICA 4: Compresión (convId estable + refresco cuando envejece)
+    // TÉCNICA 4: Compresión ASÍNCRONA — el resumen se genera en background y se
+    // aplica a partir de la SIGUIENTE petición. Así la llamada a Haiku nunca añade
+    // latencia al camino crítico de la petición del usuario.
     if (messages.length >= CONFIG.COMPRESSION_THRESHOLD && !req.headers['x-skip-compression']) {
       const cached = conversationCache.get(convId);
       const stale = !cached || (messages.length - (cached.msgCount || 0) >= CONFIG.COMPRESSION_THRESHOLD);
-      if (stale) await compressHistory(messages, system, convId, apiKey, controller.signal);
-      if (conversationCache.get(convId)) {
+      if (stale && !compressionsInFlight.has(convId)) {
+        compressionsInFlight.add(convId);
+        // Sin signal: la compresión continúa aunque esta petición termine/aborte.
+        compressHistory(messages, system, convId, apiKey, model)
+          .catch(() => {})
+          .finally(() => compressionsInFlight.delete(convId));
+      }
+      if (cached) {
         const applied = applyCompression(convId, messages, system);
         body.system = applied.system;
         body.messages = applied.messages;
@@ -339,11 +365,15 @@ app.post('/v1/messages', async (req, res) => {
     // Estos modelos también rechazan parámetros de sampling no-default.
     if (!supportsSampling(model)) { delete body.temperature; delete body.top_p; delete body.top_k; }
 
-    // TÉCNICA 2: Cache breakpoints en prefijo estable (tools + system + penúltimo msg)
-    const { optimizedSystem, optimizedMessages, optimizedTools } = injectAsymmetricCache(body.system, body.messages, body.tools);
-    body.system = optimizedSystem;
-    body.messages = optimizedMessages;
-    body.tools = optimizedTools;
+    // TÉCNICA 2: Cache breakpoints en prefijo estable (tools + system + penúltimo msg).
+    // Si el cliente YA colocó sus propios cache_control (p. ej. Claude Code), se
+    // respetan tal cual: reubicárselos invalidaría el prefijo que él ya cacheó.
+    if (!hasClientCacheControl(body.system, body.messages, body.tools)) {
+      const { optimizedSystem, optimizedMessages, optimizedTools } = injectAsymmetricCache(body.system, body.messages, body.tools);
+      body.system = optimizedSystem;
+      body.messages = optimizedMessages;
+      body.tools = optimizedTools;
+    }
 
     req.log.debug({ maxTokens: body.max_tokens, prefill: prefillApplied, tools: body.tools?.length || 0, thinking: body.thinking?.type || 'default' }, 'configuración aplicada');
 
@@ -364,14 +394,14 @@ app.post('/v1/messages', async (req, res) => {
           started = true;
         }
         if (event.type === 'message_start' && event.message?.usage) {
-          metrics.totalTokensSaved += tokensSavedFromUsage(event.message.usage);
+          addSavedTokens(tokensSavedFromUsage(event.message.usage), model);
         }
         res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       }
       res.end();
     } else {
       const response = await client.messages.create(body, { signal: controller.signal });
-      metrics.totalTokensSaved += tokensSavedFromUsage(response.usage);
+      addSavedTokens(tokensSavedFromUsage(response.usage), model);
       res.json(response);
     }
 
@@ -507,7 +537,12 @@ app.get('/stats', (req, res) => {
     cacheEntries: cacheEntries.slice(0, 10),
     uptime: process.uptime(),
     memoryUsage: process.memoryUsage(),
-    estimatedSavingsUSD: (metrics.totalTokensSaved * 0.000003).toFixed(4),
+    // USD acumulado con el precio real de cada modelo; fallback a $3/M para
+    // métricas antiguas persistidas sin desglose.
+    estimatedSavingsUSD: (metrics.totalSavingsUSD > 0
+      ? metrics.totalSavingsUSD
+      : metrics.totalTokensSaved * 0.000003
+    ).toFixed(4),
   });
 });
 
@@ -528,12 +563,16 @@ async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info({ signal }, 'apagado ordenado iniciado');
-  if (httpServer) httpServer.close();               // deja de aceptar nuevas conexiones
   drainBatchQueues('server_shutting_down');          // resuelve YA a los clientes en cola
   saveCacheToDisk();
-  logger.info('caché guardada, saliendo');
-  // Margen para que las respuestas pendientes salgan por el socket antes de salir.
-  setTimeout(() => process.exit(0), 250).unref();
+  if (httpServer) {
+    // Deja de aceptar conexiones y espera a que terminen las respuestas en vuelo
+    // (incluidos streams); las conexiones keep-alive ociosas se cierran ya.
+    httpServer.close(() => { logger.info('conexiones cerradas, saliendo'); process.exit(0); });
+    if (typeof httpServer.closeIdleConnections === 'function') httpServer.closeIdleConnections();
+  }
+  // Tope duro: si algo sigue colgado tras 5 s, salimos igualmente.
+  setTimeout(() => { logger.warn('timeout de apagado, forzando salida'); process.exit(0); }, 5000).unref();
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));

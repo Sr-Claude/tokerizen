@@ -56,6 +56,27 @@ test('supportsSampling: false donde temperature/top_p/top_k devuelven 400', () =
   assert.equal(O.supportsSampling('claude-haiku-4-5'), true);
 });
 
+// ==================== modelInputPricePerMTok ====================
+test('modelInputPricePerMTok: precio por familia de modelo', () => {
+  assert.equal(O.modelInputPricePerMTok('claude-fable-5'), 10);
+  assert.equal(O.modelInputPricePerMTok('claude-opus-4-8'), 5);
+  assert.equal(O.modelInputPricePerMTok('claude-sonnet-4-6'), 3);
+  assert.equal(O.modelInputPricePerMTok('claude-haiku-4-5'), 1);
+  assert.equal(O.modelInputPricePerMTok('modelo-desconocido'), 3);
+});
+
+// ==================== hasClientCacheControl ====================
+test('hasClientCacheControl: detecta breakpoints del cliente en system, tools o messages', () => {
+  assert.equal(O.hasClientCacheControl('texto plano', [], []), false);
+  assert.equal(O.hasClientCacheControl([{ type: 'text', text: 'x' }], [], []), false);
+  assert.equal(O.hasClientCacheControl([{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }], [], []), true);
+  assert.equal(O.hasClientCacheControl('', [], [{ name: 't', cache_control: { type: 'ephemeral' } }]), true);
+  assert.equal(O.hasClientCacheControl('', [
+    { role: 'user', content: [{ type: 'text', text: 'a', cache_control: { type: 'ephemeral' } }] },
+  ], []), true);
+  assert.equal(O.hasClientCacheControl('', [{ role: 'user', content: 'string plano' }], []), false);
+});
+
 // ==================== generateConvId ====================
 test('generateConvId: estable para el mismo primer mensaje, distinto si cambia', () => {
   const a = [{ role: 'user', content: 'hola' }, { role: 'assistant', content: 'x' }];
@@ -97,6 +118,11 @@ test('calculateMaxTokens: respuesta corta -> 30, pero nunca por encima del clien
   const msgs = [{ role: 'user', content: 'ok' }];
   assert.equal(O.calculateMaxTokens(msgs, [], 1000, 'x'), 30);
   assert.equal(O.calculateMaxTokens(msgs, [], undefined, 'x'), 30);
+});
+
+test('calculateMaxTokens: mensaje largo que empieza por "no" NO se trunca', () => {
+  const msgs = [{ role: 'user', content: 'no entiendo este código, explícamelo con mucho detalle por favor' }];
+  assert.equal(O.calculateMaxTokens(msgs, [], undefined, 'claude-sonnet-4-6'), 2048);
 });
 
 test('calculateMaxTokens: "ok" como subcadena NO trunca (regresión: "look", "token")', () => {
