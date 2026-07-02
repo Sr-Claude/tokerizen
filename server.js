@@ -516,78 +516,7 @@ app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 
 // ==================== DASHBOARD HTML (auto-generado) ====================
 if (!fs.existsSync(path.join(__dirname, 'public'))) fs.mkdirSync(path.join(__dirname, 'public'));
 
-const dashboardHTML = `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Claude Token Optimizer v3.3</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0a1a; color: #e0e0e0; padding: 20px; min-height: 100vh; }
-    .container { max-width: 1100px; margin: 0 auto; }
-    h1 { font-size: 2em; margin-bottom: 6px; background: linear-gradient(135deg, #ff6b35, #ff3366); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .subtitle { color: #888; margin-bottom: 25px; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 25px; }
-    .card { background: #1a1a2e; border-radius: 12px; padding: 18px; border: 1px solid #2a2a4a; }
-    .card h3 { font-size: 0.8em; text-transform: uppercase; letter-spacing: 1px; color: #666; margin-bottom: 8px; }
-    .card .value { font-size: 2.2em; font-weight: bold; background: linear-gradient(135deg, #ff6b35, #ff3366); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .section { background: #1a1a2e; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #2a2a4a; }
-    .section h2 { margin-bottom: 15px; color: #ff6b35; font-size: 1.1em; }
-    table { width: 100%; border-collapse: collapse; }
-    td { padding: 9px; border-bottom: 1px solid #2a2a4a; }
-    .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.75em; font-weight: bold; }
-    .badge.active { background: #1b5e20; color: #4caf50; }
-    .badge.optin { background: #37474f; color: #90a4ae; }
-    .badge.fable { background: #4a148c; color: #ce93d8; }
-    button { background: #ff6b35; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; }
-    button:hover { background: #ff8855; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🦊 Claude Token Optimizer v3.3</h1>
-    <p class="subtitle">Proxy inteligente para Anthropic — Fable 5, Haiku, Sonnet, Opus · streaming + batch</p>
-    <div class="cards" id="cards"></div>
-    <div class="section">
-      <h2>⚙️ Estado del Sistema</h2>
-      <table>
-        <tr><td>Streaming (SSE)</td><td><span class="badge active">Activo</span></td></tr>
-        <tr><td>Cache Asimétrica</td><td><span class="badge active">Activo (tools + system)</span></td></tr>
-        <tr><td>Dynamic Max Tokens</td><td><span class="badge active">Activo (respeta cliente)</span></td></tr>
-        <tr><td>Compresión Historial</td><td><span class="badge active">Activo (Haiku)</span></td></tr>
-        <tr><td>Prefill Detection</td><td><span class="badge active">Activo</span></td></tr>
-        <tr><td>Tool Pruning</td><td><span class="badge optin">Opt-in (x-tool-pruning)</span></td></tr>
-        <tr><td>Anti-preamble</td><td><span class="badge optin">Opt-in (x-anti-preamble)</span></td></tr>
-        <tr><td>Uptime</td><td id="uptime">--</td></tr>
-        <tr><td>Memoria</td><td id="memory">--</td></tr>
-      </table>
-    </div>
-    <button onclick="refresh()">🔄 Actualizar</button>
-  </div>
-  <script>
-    async function refresh() {
-      try {
-        const d = await (await fetch('/stats')).json();
-        const items = [
-          ['Peticiones', d.totalRequests],
-          ['Tokens Ahorrados', d.totalTokensSaved.toLocaleString()],
-          ['Ahorro USD', '$' + d.estimatedSavingsUSD],
-          ['Cachés', d.activeCaches],
-          ['Batch Calls', d.totalBatchCalls],
-          ['Compresiones', d.totalCompressions],
-        ];
-        document.getElementById('cards').innerHTML = items.map(([l, v]) =>
-          '<div class="card"><h3>' + l + '</h3><div class="value">' + v + '</div></div>').join('');
-        document.getElementById('uptime').textContent = Math.floor(d.uptime / 60) + ' min';
-        document.getElementById('memory').textContent = (d.memoryUsage.heapUsed / 1024 / 1024).toFixed(1) + ' MB';
-      } catch (e) { console.error(e); }
-    }
-    refresh();
-    setInterval(refresh, 5000);
-  </script>
-</body>
-</html>`;
+const dashboardHTML = require('./lib/dashboard');
 
 fs.writeFileSync(path.join(__dirname, 'public', 'dashboard.html'), dashboardHTML);
 
