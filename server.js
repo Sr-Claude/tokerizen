@@ -5,30 +5,103 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+const logger = require('./lib/logger');
+
+// Interop CJS/ESM defensivo para pino-http y express-rate-limit.
+const _pinoHttp = require('pino-http');
+const pinoHttp = typeof _pinoHttp === 'function' ? _pinoHttp : (_pinoHttp.pinoHttp || _pinoHttp.default);
+const _erl = require('express-rate-limit');
+const rateLimit = typeof _erl === 'function' ? _erl : (_erl.rateLimit || _erl.default);
+const ipKeyGenerator = _erl.ipKeyGenerator || (typeof _erl === 'function' ? _erl.ipKeyGenerator : undefined) || ((ip) => ip);
+
+const {
+  CONFIG,
+  deepClone,
+  isFable5Model,
+  supportsPrefill,
+  supportsSampling,
+  generateConvId,
+  extractLastUserText,
+  hasRecentToolResult,
+  estimateTokens,
+  pruneTools,
+  injectAsymmetricCache,
+  calculateMaxTokens,
+  buildCompressedMessages,
+  detectAndApplyPrefill,
+  buildBatchPrompt,
+  parseBatchResponse,
+} = require('./lib/optimizer');
+
 const app = express();
+app.set('trust proxy', 1); // 1 salto (nginx/PM2/Docker) para que req.ip sea correcto
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ==================== CONFIGURACIÓN ====================
-const CONFIG = {
-  COMPRESSION_THRESHOLD: 10,
-  MAX_TURNS_AFTER_COMPRESSION: 6,
-  COMPRESSION_MODEL: process.env.COMPRESSION_MODEL || 'claude-3-haiku-20240307',
-  COMPRESSION_MAX_TOKENS: 400,
-  CACHE_TTL_MS: 5 * 60 * 1000,
-  BATCH_WINDOW_MS: 200,
-  BATCH_MAX_TASKS: 8,
-  CACHE_FILE: process.env.CACHE_FILE || './cache.json',
-  // Tool pruning desactivado por defecto (opt-in vía cabecera x-tool-pruning)
-  TOOL_PRUNING_ENABLED: false,
-  ALWAYS_KEEP_TOOLS: ['read', 'write', 'edit', 'bash', 'search', 'grep', 'glob', 'list'],
-  DEFAULT_STOP_SEQUENCE: '[FIN]',
-  ANTI_PREAMBLE_PROMPT: '\n\nCRITICAL: Do NOT explain your reasoning. Output ONLY tool_use blocks immediately, or extremely brief answers if no tools are needed. When finished, output exactly "[FIN]".',
-  BATCH_DELIMITER_START: '---TASK_',
-  BATCH_DELIMITER_END: '---END_TASK_',
-  FABLE5_MODEL_PATTERN: /fable/i,
-};
+// Logging estructurado por petición (con request-id). No registra endpoints ruidosos.
+app.use(pinoHttp({
+  logger,
+  autoLogging: {
+    ignore: (req) => req.url === '/health' || req.url.startsWith('/stats') || req.url.startsWith('/dashboard') || req.url === '/favicon.ico',
+  },
+  customLogLevel: (req, res, err) => {
+    if (err || res.statusCode >= 500) return 'error';
+    if (res.statusCode >= 429) return 'warn';
+    return 'info';
+  },
+}));
+
+// Durante el apagado ordenado, rechazamos nuevas peticiones con 503 (reintentables).
+let shuttingDown = false;
+app.use((req, res, next) => {
+  if (shuttingDown) return res.status(503).json({ error: 'server_restarting', message: 'El proxy se está reiniciando, reintenta.' });
+  next();
+});
+
+// Hash corto (no reversible) para no retener API keys en claro en memoria
+// (rate limiter, claves de caché, colas de batch).
+function hashKey(value) {
+  return crypto.createHash('sha256').update(value || '').digest('hex').slice(0, 16);
+}
+
+// Rate limiting por API key (respaldo: IP). Solo en las rutas que llaman a Anthropic.
+const apiLimiter = rateLimit({
+  windowMs: CONFIG.RATE_LIMIT_WINDOW_MS,
+  limit: CONFIG.RATE_LIMIT_MAX,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const cred = req.headers['x-api-key'] || req.headers['authorization'];
+    return cred ? hashKey(cred) : ipKeyGenerator(req.ip);
+  },
+  handler: (req, res) => {
+    req.log?.warn({ path: req.path }, 'rate limit excedido');
+    res.status(429).json({ error: 'rate_limited', message: 'Demasiadas peticiones, reduce el ritmo.' });
+  },
+});
+app.use('/v1', apiLimiter);
+
+// Cliente Anthropic con timeout y reintentos: una petición colgada no bloquea recursos indefinidamente.
+// Se reutiliza la instancia por API key (el SDK es seguro para reutilizar); cota simple para no crecer sin límite.
+const clientCache = new Map();
+function makeClient(apiKey) {
+  const key = apiKey || '';
+  let client = clientCache.get(key);
+  if (!client) {
+    if (clientCache.size >= 100) clientCache.clear();
+    client = new Anthropic({ apiKey, timeout: CONFIG.REQUEST_TIMEOUT_MS, maxRetries: CONFIG.MAX_RETRIES });
+    clientCache.set(key, client);
+  }
+  return client;
+}
+
+// Ahorro REAL de tokens por caché de prefijo: los tokens leídos de caché cuestan ~10%,
+// así que el ahorro es ~90% de cache_read_input_tokens (dato que devuelve la propia API).
+function tokensSavedFromUsage(usage) {
+  if (!usage) return 0;
+  return Math.floor((usage.cache_read_input_tokens || 0) * 0.9);
+}
 
 // ==================== PERSISTENCIA ====================
 let conversationCache = new Map();
@@ -46,10 +119,10 @@ function loadCacheFromDisk() {
       const data = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, 'utf-8'));
       if (data.conversationCache) conversationCache = new Map(Object.entries(data.conversationCache));
       if (data.metrics) metrics = { ...metrics, ...data.metrics };
-      console.log(`[TokenOptimizer] Caché cargada: ${conversationCache.size} entradas.`);
+      logger.info({ entries: conversationCache.size }, 'caché cargada desde disco');
     }
   } catch (err) {
-    console.error('[TokenOptimizer] Error cargando caché:', err.message);
+    logger.error({ err }, 'error cargando caché');
   }
 }
 
@@ -61,141 +134,23 @@ function saveCacheToDisk() {
       lastSaved: new Date().toISOString(),
     }, null, 2));
   } catch (err) {
-    console.error('[TokenOptimizer] Error guardando caché:', err.message);
+    logger.error({ err }, 'error guardando caché');
   }
 }
 
-setInterval(saveCacheToDisk, 30_000);
+// unref: estos timers no deben impedir un cierre limpio del proceso.
+setInterval(saveCacheToDisk, 30_000).unref();
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [k, v] of conversationCache) {
     if (now - v.timestamp > CONFIG.CACHE_TTL_MS) { conversationCache.delete(k); cleaned++; }
   }
-  if (cleaned > 0) { console.log(`[TokenOptimizer] ${cleaned} cachés expiradas.`); saveCacheToDisk(); }
-}, 60_000);
+  if (cleaned > 0) { logger.info({ cleaned }, 'cachés expiradas eliminadas'); saveCacheToDisk(); }
+}, 60_000).unref();
 
-// ==================== UTILIDADES ====================
-function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
-
-function isFable5Model(model) { return CONFIG.FABLE5_MODEL_PATTERN.test(model || ''); }
-
-// convId derivado de un prefijo ESTABLE (primer mensaje), no de todo el historial:
-// así la caché de compresión se reutiliza turno a turno aunque la conversación crezca.
-function generateConvId(messages) {
-  if (!messages || messages.length === 0) return crypto.randomBytes(8).toString('hex');
-  const anchor = JSON.stringify(messages[0]);
-  return crypto.createHash('sha256').update(anchor).digest('hex').slice(0, 16);
-}
-
-function extractLastUserText(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role !== 'user') continue;
-    const content = messages[i].content;
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-      const textBlock = content.find(c => c.type === 'text');
-      if (textBlock?.text) return textBlock.text;
-    }
-    break; // solo miramos el último turno del usuario
-  }
-  return '';
-}
-
-// ¿El último mensaje del usuario es un tool_result? (estamos en mitad de un bucle de herramientas)
-function hasRecentToolResult(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role !== 'user') continue;
-    if (Array.isArray(messages[i].content) && messages[i].content.some(c => c.type === 'tool_result')) return true;
-    break;
-  }
-  return false;
-}
-
-function estimateTokens(text) {
-  if (text == null) return 0;
-  if (typeof text === 'number') text = String(text);
-  return Math.ceil(text.length / 3.5);
-}
-
-// ==================== TÉCNICA 1: TOOL PRUNING (OPT-IN) ====================
-function pruneTools(tools, lastUserMessage, enabled) {
-  if (!enabled || !tools || tools.length <= 3) return tools;
-  const msgLower = (lastUserMessage || '').toLowerCase();
-  const alwaysKeep = new Set(CONFIG.ALWAYS_KEEP_TOOLS);
-  const mentioned = tools.filter(t => msgLower.includes(t.name.toLowerCase()));
-  const base = tools.filter(t => alwaysKeep.has(t.name.toLowerCase()));
-  const merged = [...new Set([...base, ...mentioned])];
-  return merged.length >= 2 ? merged : tools;
-}
-
-// ==================== TÉCNICA 2: CACHE ASIMÉTRICA ====================
-// Breakpoints sobre el PREFIJO ESTABLE: tools -> system -> penúltimo mensaje.
-function injectAsymmetricCache(system, messages, tools) {
-  // --- system ---
-  let optimizedSystem = system;
-  const clonedSystem = deepClone(system);
-  if (Array.isArray(clonedSystem)) {
-    clonedSystem.forEach(b => { if (b && b.cache_control) delete b.cache_control; });
-    // marcar el último bloque con texto
-    for (let i = clonedSystem.length - 1; i >= 0; i--) {
-      if (clonedSystem[i] && clonedSystem[i].text) { clonedSystem[i].cache_control = { type: 'ephemeral' }; break; }
-    }
-    optimizedSystem = clonedSystem;
-  } else if (typeof clonedSystem === 'string' && clonedSystem.trim()) {
-    optimizedSystem = [{ type: 'text', text: clonedSystem, cache_control: { type: 'ephemeral' } }];
-  } else {
-    optimizedSystem = clonedSystem; // system vacío: no cacheamos un bloque vacío
-  }
-
-  // --- tools (el bloque estable más grande en agentes) ---
-  let optimizedTools = tools;
-  if (Array.isArray(tools) && tools.length > 0) {
-    optimizedTools = deepClone(tools);
-    optimizedTools.forEach(t => { if (t.cache_control) delete t.cache_control; });
-    optimizedTools[optimizedTools.length - 1].cache_control = { type: 'ephemeral' };
-  }
-
-  // --- messages: breakpoint en el penúltimo (prefijo estable), no en el volátil ---
-  const optimizedMessages = deepClone(messages);
-  if (optimizedMessages.length >= 2) {
-    const bp = optimizedMessages[optimizedMessages.length - 2];
-    const content = Array.isArray(bp.content) ? bp.content : [{ type: 'text', text: bp.content }];
-    content.forEach(b => { if (b && b.cache_control) delete b.cache_control; });
-    if (content.length > 0) content[content.length - 1].cache_control = { type: 'ephemeral' };
-    bp.content = content;
-  }
-
-  return { optimizedSystem, optimizedMessages, optimizedTools };
-}
-
-// ==================== TÉCNICA 3: DYNAMIC MAX TOKENS ====================
-function calculateMaxTokens(messages, tools, clientMax, model) {
-  // En bucle de herramientas NO truncamos: respetamos lo que pidió el cliente.
-  if (hasRecentToolResult(messages)) return clientMax || 4096;
-
-  const lastText = extractLastUserText(messages);
-  if (!lastText) return clientMax || 4096;
-
-  const lower = lastText.toLowerCase();
-  let suggested;
-  if (lower.startsWith('yes') || lower.startsWith('no') || lower.includes('confirm') || lower.includes('ok') || (lower.length < 10 && !lower.includes('\n'))) {
-    suggested = 30;
-  } else if (lower.includes('brief') || lower.includes('short') || lower.includes('one word')) {
-    suggested = 50;
-  } else if (lower.includes('translate') || lower.includes('define')) {
-    suggested = 100;
-  } else if (tools && tools.length > 0) {
-    suggested = isFable5Model(model) ? 8192 : 4096;
-  } else {
-    suggested = isFable5Model(model) ? 4096 : 2048;
-  }
-  // Nunca por encima de lo que pidió el cliente.
-  return clientMax ? Math.min(suggested, clientMax) : suggested;
-}
-
-// ==================== TÉCNICA 4: COMPRESIÓN DE HISTORIAL ====================
-async function compressHistory(messages, system, convId, apiKey) {
+// ==================== COMPRESIÓN (parte impura) ====================
+async function compressHistory(messages, system, convId, apiKey, signal) {
   const turns = messages.filter(m => m.role === 'user' || m.role === 'assistant');
   const conversationText = turns.map(m => {
     const role = m.role === 'user' ? 'User' : 'Assistant';
@@ -206,14 +161,14 @@ async function compressHistory(messages, system, convId, apiKey) {
   }).join('\n\n');
 
   try {
-    const client = new Anthropic({ apiKey });
+    const client = makeClient(apiKey);
     const resp = await client.messages.create({
       model: CONFIG.COMPRESSION_MODEL,
       max_tokens: CONFIG.COMPRESSION_MAX_TOKENS,
       temperature: 0,
       system: 'Summarize the following conversation. Preserve ALL decisions, code snippets, file paths, commands executed, key facts, and pending tasks. Omit greetings, apologies, and filler. Use Spanish if the conversation is in Spanish.',
       messages: [{ role: 'user', content: conversationText }],
-    });
+    }, { signal });
 
     const summary = resp.content.find(c => c.type === 'text')?.text || '';
     const beforeTokens = estimateTokens(conversationText);
@@ -228,55 +183,12 @@ async function compressHistory(messages, system, convId, apiKey) {
     metrics.totalCompressions++;
     metrics.totalTokensSaved += Math.max(0, beforeTokens - afterTokens);
 
-    console.log(`[TokenOptimizer] Compresión convId=${convId}. Ahorro ~${beforeTokens - afterTokens} tokens.`);
+    logger.info({ convId, savedTokens: beforeTokens - afterTokens }, 'historial comprimido');
     return { convId, summary };
   } catch (err) {
-    console.error('[TokenOptimizer] Error compresión:', err.message);
+    logger.error({ err, convId }, 'error comprimiendo historial');
     return null;
   }
-}
-
-// Elimina tool_use finales sin su tool_result (evita 400 por tool_use huérfano).
-function ensureToolPairs(messages) {
-  const result = [...messages];
-  const pending = new Set();
-  for (const msg of result) {
-    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
-      msg.content.filter(c => c.type === 'tool_use').forEach(tu => pending.add(tu.id));
-    }
-    if (msg.role === 'user' && Array.isArray(msg.content)) {
-      msg.content.filter(c => c.type === 'tool_result').forEach(tr => pending.delete(tr.tool_use_id));
-    }
-  }
-  if (pending.size > 0) {
-    while (result.length > 0 && result[result.length - 1].role !== 'user') result.pop();
-  }
-  return result;
-}
-
-// Construye [resumen + recientes] sin dejar dos 'user' seguidos ni tool_result huérfanos al inicio.
-function buildCompressedMessages(summary, recent) {
-  const summaryText = `[PREVIOUS CONVERSATION SUMMARY]\n${summary}\n[END SUMMARY]\n\nContinue helping based on this context. Do not mention this summary.`;
-
-  // Quitar tool_results huérfanos al inicio (su tool_use quedó fuera del corte).
-  while (recent.length && recent[0].role === 'user' && Array.isArray(recent[0].content) && recent[0].content.some(c => c.type === 'tool_result')) {
-    recent = recent.slice(1);
-  }
-  recent = ensureToolPairs(recent);
-
-  if (recent.length === 0) return [{ role: 'user', content: summaryText }];
-
-  const first = recent[0];
-  if (first.role === 'user') {
-    // Fusionar el resumen dentro del primer mensaje de usuario (evita user+user).
-    let mergedContent;
-    if (typeof first.content === 'string') mergedContent = `${summaryText}\n\n${first.content}`;
-    else if (Array.isArray(first.content)) mergedContent = [{ type: 'text', text: summaryText }, ...first.content];
-    else mergedContent = summaryText;
-    return [{ ...first, content: mergedContent }, ...recent.slice(1)];
-  }
-  // recent empieza con assistant -> user(resumen) + assistant... alterna bien.
-  return [{ role: 'user', content: summaryText }, ...recent];
 }
 
 function applyCompression(convId, messages, system) {
@@ -287,75 +199,23 @@ function applyCompression(convId, messages, system) {
   return { system, messages: buildCompressedMessages(cached.summary, recent) };
 }
 
-// ==================== TÉCNICA 5: PREFILL (vía mensaje assistant) ====================
-function detectAndApplyPrefill(lastUserText) {
-  if (!lastUserText) return { prefillMessage: null, stopSequences: [] };
-  const lower = lastUserText.toLowerCase();
-  let prefillText = '';
-  let stopSequences = [];
-
-  if (lower.includes('json') || lower.includes('{') || lower.includes('object') || lower.includes('structured')) {
-    prefillText = '{';
-  }
-  if (lower.includes('list') || lower.includes('bullet') || lower.includes('enumera')) {
-    prefillText = prefillText || '-';
-  }
-  if (lower.includes('code') || lower.includes('function') || lower.includes('script') || lower.includes('```')) {
-    prefillText = '```';
-    stopSequences = ['```\n'];
-  }
-  if (lower.includes('continúa') || lower.includes('continue')) {
-    const m = lastUserText.match(/(?:sección|section|parte|part)\s*[:"]?\s*([^\n"]+)/i);
-    if (m) prefillText = m[1].trim();
-  }
-
-  // El contenido assistant NO puede terminar en espacio/nueva línea (la API devuelve 400).
-  prefillText = prefillText.replace(/\s+$/, '');
-
-  return {
-    prefillMessage: prefillText ? { role: 'assistant', content: prefillText } : null,
-    stopSequences,
-  };
-}
-
-// ==================== BATCH ====================
-function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-function buildBatchPrompt(tasks, system) {
-  const sections = tasks.map((t, i) => `${CONFIG.BATCH_DELIMITER_START}${i + 1}\n${t.prompt}\n${CONFIG.BATCH_DELIMITER_END}${i + 1}`);
-  return {
-    batchSystem: `${system || ''}
-
-IMPORTANT: You are processing MULTIPLE INDEPENDENT TASKS in one request.
-Each task is delimited by "${CONFIG.BATCH_DELIMITER_START}N" and "${CONFIG.BATCH_DELIMITER_END}N".
-Respond to EACH task using the EXACT SAME delimiters. No text outside the delimiters.`,
-    batchUserMessage: sections.join('\n\n'),
-  };
-}
-
-function parseBatchResponse(text) {
-  const results = [];
-  const regex = new RegExp(`${escapeRegex(CONFIG.BATCH_DELIMITER_START)}(\\d+)\\n([\\s\\S]*?)${escapeRegex(CONFIG.BATCH_DELIMITER_END)}\\d+`, 'g');
-  let m;
-  while ((m = regex.exec(text)) !== null) results[parseInt(m[1], 10) - 1] = m[2].trim();
-  return results.filter(r => r !== undefined);
-}
-
+// ==================== BATCH (parte impura) ====================
 async function processBatch(tasks, system, apiKey, options = {}) {
   const { batchSystem, batchUserMessage } = buildBatchPrompt(tasks, system);
-  const model = options.model || 'claude-sonnet-4-20250514';
-  const client = new Anthropic({ apiKey });
+  const model = options.model || CONFIG.DEFAULT_MODEL;
+  const client = makeClient(apiKey);
 
   const requestBody = {
     model,
     max_tokens: options.maxTokens || (isFable5Model(model) ? 8192 : 4096),
-    temperature: options.temperature ?? 0,
     system: batchSystem,
     messages: [{ role: 'user', content: batchUserMessage }],
   };
-  if (isFable5Model(model)) requestBody.thinking = { type: 'disabled' };
+  // temperature devuelve 400 en Fable 5 / Opus 4.7+/ Sonnet 5; solo se envía donde se acepta.
+  if (supportsSampling(model)) requestBody.temperature = options.temperature ?? 0;
+  // Nota: NO se envía thinking:{disabled} a Fable 5 — la API lo rechaza (thinking siempre activo).
 
-  const resp = await client.messages.create(requestBody);
+  const resp = await client.messages.create(requestBody, { signal: options.signal });
   const text = resp.content.find(c => c.type === 'text')?.text || '';
   const parsed = parseBatchResponse(text);
 
@@ -376,12 +236,24 @@ async function flushBatchQueue(key) {
   const resolvers = [...queue.resolvers];
   delete batchQueues[key];
 
-  console.log(`[TokenOptimizer] Batch auto: ${tasks.length} tareas (grupo ${key}).`);
+  logger.info({ tasks: tasks.length, group: key }, 'procesando batch automático');
   try {
     const results = await processBatch(tasks, tasks[0].system || '', tasks[0].apiKey, { model: tasks[0].model });
     resolvers.forEach((r, i) => r.resolve(results[i] || { content: '', error: 'No result' }));
   } catch (err) {
+    logger.error({ err, group: key }, 'error procesando batch automático');
     resolvers.forEach(r => r.resolve({ content: '', error: err.message }));
+  }
+}
+
+// Drena TODAS las colas resolviendo ya a los clientes en espera (evita que se cuelguen
+// hasta el timeout si el proceso se reinicia). Usado en el apagado ordenado.
+function drainBatchQueues(reason) {
+  for (const key of Object.keys(batchQueues)) {
+    const q = batchQueues[key];
+    if (q.timer) clearTimeout(q.timer);
+    q.resolvers.forEach(r => r.resolve({ content: '', error: reason }));
+    delete batchQueues[key];
   }
 }
 
@@ -396,17 +268,29 @@ app.post('/v1/messages', async (req, res) => {
   const optInAntiPreamble = req.headers['x-anti-preamble'] === 'true';
   const toolPruning = req.headers['x-tool-pruning'] === 'true' || CONFIG.TOOL_PRUNING_ENABLED;
 
+  // Si el cliente cierra la conexión, abortamos la llamada upstream para liberar recursos.
+  const controller = new AbortController();
+  const onClose = () => { if (!res.writableEnded) controller.abort(); };
+  res.once('close', onClose);
+
   try {
     const body = deepClone(originalBody);
     const messages = body.messages || [];
+    if (!Array.isArray(messages)) {
+      return res.status(400).json({ error: 'invalid_request', message: '"messages" debe ser un array.' });
+    }
     const system = body.system || '';
-    const model = body.model || 'claude-sonnet-4-20250514';
-    const convId = req.headers['x-conversation-id'] || generateConvId(messages);
+    const model = body.model || CONFIG.DEFAULT_MODEL;
+    // La caché de compresión se aísla por API key: sin esto, un cliente podría
+    // leer el resumen de la conversación de OTRO usuario enviando su x-conversation-id.
+    const keyScope = hashKey(apiKey);
+    const rawConvId = req.headers['x-conversation-id'] || generateConvId(messages);
+    const convId = rawConvId.startsWith(`${keyScope}:`) ? rawConvId : `${keyScope}:${rawConvId}`;
     const lastUserText = extractLastUserText(messages);
     const inToolLoop = hasRecentToolResult(messages);
     const isFable = isFable5Model(model);
 
-    console.log(`[TokenOptimizer] ${isFable ? '🦊' : '🤖'} convId=${convId} msgs=${messages.length} tools=${body.tools?.length || 0} model=${model} stream=${clientStream}`);
+    req.log.info({ convId, msgs: messages.length, tools: body.tools?.length || 0, model, stream: clientStream, fable: isFable }, 'petición /v1/messages');
 
     // TÉCNICA 1: Tool Pruning (opt-in)
     body.tools = pruneTools(body.tools || [], lastUserText, toolPruning);
@@ -418,7 +302,7 @@ app.post('/v1/messages', async (req, res) => {
     if (messages.length >= CONFIG.COMPRESSION_THRESHOLD && !req.headers['x-skip-compression']) {
       const cached = conversationCache.get(convId);
       const stale = !cached || (messages.length - (cached.msgCount || 0) >= CONFIG.COMPRESSION_THRESHOLD);
-      if (stale) await compressHistory(messages, system, convId, apiKey);
+      if (stale) await compressHistory(messages, system, convId, apiKey, controller.signal);
       if (conversationCache.get(convId)) {
         const applied = applyCompression(convId, messages, system);
         body.system = applied.system;
@@ -428,9 +312,10 @@ app.post('/v1/messages', async (req, res) => {
       }
     }
 
-    // TÉCNICA 5: Prefill vía mensaje assistant (nunca dentro de un bucle de tools)
+    // TÉCNICA 5: Prefill vía mensaje assistant (nunca dentro de un bucle de tools).
+    // OMITIDO en Fable 5 / familia 4.6+ : la API devuelve 400 con prefill en el último turno.
     let prefillApplied = false;
-    if (!inToolLoop) {
+    if (!inToolLoop && supportsPrefill(model)) {
       const { prefillMessage, stopSequences } = detectAndApplyPrefill(lastUserText);
       const last = body.messages[body.messages.length - 1];
       if (prefillMessage && last?.role === 'user') {
@@ -441,13 +326,18 @@ app.post('/v1/messages', async (req, res) => {
     }
 
     // Anti-preamble: SOLO opt-in y sobre system string (antes de cachear).
-    if (optInAntiPreamble && typeof body.system === 'string' && body.system.trim()) {
+    // Se OMITE si hay tools: el stop "[FIN]" podría truncar una cadena de tool_use a medias.
+    if (optInAntiPreamble && !body.tools?.length && typeof body.system === 'string' && body.system.trim()) {
       body.system += CONFIG.ANTI_PREAMBLE_PROMPT;
       body.stop_sequences = [...(body.stop_sequences || []), CONFIG.DEFAULT_STOP_SEQUENCE];
     }
 
-    // Fable 5: desactivar thinking (más barato/directo)
-    if (isFable) body.thinking = { type: 'disabled' };
+    // Fable 5: el thinking es siempre-activo y un {type:'disabled'} o
+    // {type:'enabled', budget_tokens} explícito devuelve 400 → se omite el parámetro
+    // salvo que el cliente pida 'adaptive' (único valor aceptado explícitamente).
+    if (isFable && body.thinking && body.thinking.type !== 'adaptive') delete body.thinking;
+    // Estos modelos también rechazan parámetros de sampling no-default.
+    if (!supportsSampling(model)) { delete body.temperature; delete body.top_p; delete body.top_k; }
 
     // TÉCNICA 2: Cache breakpoints en prefijo estable (tools + system + penúltimo msg)
     const { optimizedSystem, optimizedMessages, optimizedTools } = injectAsymmetricCache(body.system, body.messages, body.tools);
@@ -455,15 +345,15 @@ app.post('/v1/messages', async (req, res) => {
     body.messages = optimizedMessages;
     body.tools = optimizedTools;
 
-    console.log(`[TokenOptimizer] max_tokens=${body.max_tokens} prefill=${prefillApplied} tools=${body.tools?.length || 0} thinking=${body.thinking?.type || 'default'}`);
+    req.log.debug({ maxTokens: body.max_tokens, prefill: prefillApplied, tools: body.tools?.length || 0, thinking: body.thinking?.type || 'default' }, 'configuración aplicada');
 
-    const client = new Anthropic({ apiKey });
+    const client = makeClient(apiKey);
 
     if (clientStream) {
       // MODO STREAMING — cabeceras diferidas hasta el primer evento para poder
       // capturar errores previos (p.ej. 400 de caché) en el catch.
       delete body.stream;
-      const stream = client.messages.stream(body);
+      const stream = client.messages.stream(body, { signal: controller.signal });
       let started = false;
       for await (const event of stream) {
         if (!started) {
@@ -474,19 +364,22 @@ app.post('/v1/messages', async (req, res) => {
           started = true;
         }
         if (event.type === 'message_start' && event.message?.usage) {
-          metrics.totalTokensSaved += Math.floor((event.message.usage.input_tokens || 0) * 0.7);
+          metrics.totalTokensSaved += tokensSavedFromUsage(event.message.usage);
         }
         res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       }
       res.end();
     } else {
-      const response = await client.messages.create(body);
-      if (response.usage) metrics.totalTokensSaved += Math.floor((response.usage.input_tokens || 0) * 0.7);
+      const response = await client.messages.create(body, { signal: controller.signal });
+      metrics.totalTokensSaved += tokensSavedFromUsage(response.usage);
       res.json(response);
     }
 
   } catch (error) {
-    console.error('[TokenOptimizer] Error:', error.status, error.error || error.message);
+    // El cliente se desconectó y abortamos: no hay a quién responder.
+    if (controller.signal.aborted) { try { res.end(); } catch (_) {} return; }
+
+    req.log.error({ err: error, status: error.status }, 'error en /v1/messages');
 
     // Si el stream ya empezó, no podemos reenviar cabeceras: cerramos.
     if (res.headersSent) { try { res.end(); } catch (_) {} return; }
@@ -499,22 +392,24 @@ app.post('/v1/messages', async (req, res) => {
         cleanBody.messages?.forEach(m => { if (Array.isArray(m.content)) m.content.forEach(b => delete b.cache_control); });
         if (Array.isArray(cleanBody.tools)) cleanBody.tools.forEach(t => delete t.cache_control);
 
-        const client = new Anthropic({ apiKey });
+        const client = makeClient(apiKey);
         if (cleanBody.stream) {
           delete cleanBody.stream;
-          const stream = client.messages.stream(cleanBody);
+          const stream = client.messages.stream(cleanBody, { signal: controller.signal });
           res.setHeader('Content-Type', 'text/event-stream');
           for await (const event of stream) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
           return res.end();
         }
-        const response = await client.messages.create(cleanBody);
+        const response = await client.messages.create(cleanBody, { signal: controller.signal });
         return res.json(response);
       } catch (retryError) {
-        console.error('[TokenOptimizer] Fallo reintento:', retryError.message);
+        req.log.error({ err: retryError }, 'falló el reintento sin cache_control');
       }
     }
 
     res.status(error.status || 500).json({ error: true, message: error.error || error.message });
+  } finally {
+    res.removeListener('close', onClose);
   }
 });
 
@@ -526,7 +421,10 @@ app.post('/v1/batch', async (req, res) => {
     if (tasks.length > CONFIG.BATCH_MAX_TASKS) return res.status(400).json({ error: `Máximo ${CONFIG.BATCH_MAX_TASKS} tareas. Recibido: ${tasks.length}.` });
 
     const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || process.env.ANTHROPIC_API_KEY;
-    const results = await processBatch(tasks, system, apiKey, { model, maxTokens: max_tokens, temperature });
+    const controller = new AbortController();
+    res.once('close', () => { if (!res.writableEnded) controller.abort(); });
+
+    const results = await processBatch(tasks, system, apiKey, { model, maxTokens: max_tokens, temperature, signal: controller.signal });
 
     const sysTokens = estimateTokens(typeof system === 'string' ? system : JSON.stringify(system || ''));
     const promptTokens = tasks.reduce((s, t) => s + estimateTokens(t.prompt || ''), 0);
@@ -544,7 +442,7 @@ app.post('/v1/batch', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('[TokenOptimizer] Error batch:', error.status, error.error || error.message);
+    req.log.error({ err: error, status: error.status }, 'error en /v1/batch');
     res.status(error.status || 500).json({ error: true, message: error.error || error.message });
   }
 });
@@ -556,9 +454,9 @@ app.post('/v1/batch/auto', async (req, res) => {
     if (!prompt) return res.status(400).json({ error: 'Se requiere "prompt".' });
 
     const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || process.env.ANTHROPIC_API_KEY;
-    const sysKey = crypto.createHash('md5').update(system || '').digest('hex').slice(0, 8);
+    const sysKey = crypto.createHash('sha256').update(system || '').digest('hex').slice(0, 12);
     const modelKey = (model || 'default').replace(/[^a-z0-9]/gi, '');
-    const keyKey = crypto.createHash('md5').update(apiKey || '').digest('hex').slice(0, 8);
+    const keyKey = hashKey(apiKey);
     const queueKey = `${sysKey}|${modelKey}|${keyKey}`;
 
     if (!batchQueues[queueKey]) batchQueues[queueKey] = { tasks: [], resolvers: [], timer: null };
@@ -574,8 +472,13 @@ app.post('/v1/batch/auto', async (req, res) => {
 
     const result = await Promise.race([
       resultPromise,
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 30000)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), CONFIG.BATCH_TASK_TIMEOUT_MS)),
     ]);
+
+    // Si el drenaje de apagado resolvió la tarea, devolvemos 503 reintentable.
+    if (result && result.error === 'server_shutting_down') {
+      return res.status(503).json({ status: 'server_restarting', taskId, message: 'El proxy se está reiniciando, reintenta.' });
+    }
     res.json({ status: 'completed', taskId, result });
   } catch (error) {
     const isTimeout = error.message === 'timeout';
@@ -585,7 +488,7 @@ app.post('/v1/batch/auto', async (req, res) => {
 
 // ==================== HEALTH / STATS / DASHBOARD ====================
 app.get('/health', (req, res) => res.json({
-  status: 'ok',
+  status: shuttingDown ? 'shutting_down' : 'ok',
   uptime: process.uptime(),
   memory: process.memoryUsage().heapUsed / 1024 / 1024,
   cacheSize: conversationCache.size,
@@ -618,7 +521,7 @@ const dashboardHTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Claude Token Optimizer v3.2</title>
+  <title>Claude Token Optimizer v3.3</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0a1a; color: #e0e0e0; padding: 20px; min-height: 100vh; }
@@ -643,7 +546,7 @@ const dashboardHTML = `<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
-    <h1>🦊 Claude Token Optimizer v3.2</h1>
+    <h1>🦊 Claude Token Optimizer v3.3</h1>
     <p class="subtitle">Proxy inteligente para Anthropic — Fable 5, Haiku, Sonnet, Opus · streaming + batch</p>
     <div class="cards" id="cards"></div>
     <div class="section">
@@ -688,14 +591,32 @@ const dashboardHTML = `<!DOCTYPE html>
 
 fs.writeFileSync(path.join(__dirname, 'public', 'dashboard.html'), dashboardHTML);
 
-// ==================== ARRANQUE ====================
+// ==================== ARRANQUE Y APAGADO ORDENADO ====================
 const PORT = process.env.PORT || 8080;
-loadCacheFromDisk();
+let httpServer;
 
-app.listen(PORT, () => {
-  console.log(`
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'apagado ordenado iniciado');
+  if (httpServer) httpServer.close();               // deja de aceptar nuevas conexiones
+  drainBatchQueues('server_shutting_down');          // resuelve YA a los clientes en cola
+  saveCacheToDisk();
+  logger.info('caché guardada, saliendo');
+  // Margen para que las respuestas pendientes salgan por el socket antes de salir.
+  setTimeout(() => process.exit(0), 250).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// Solo arrancamos el servidor si el archivo se ejecuta directamente (no al importarlo en tests).
+if (require.main === module) {
+  loadCacheFromDisk();
+  httpServer = app.listen(PORT, () => {
+    console.log(`
 ╔══════════════════════════════════════════════════════╗
-║   🦊 Claude Token Optimizer v3.2 (Producción)        ║
+║   🦊 Claude Token Optimizer v3.3 (Producción)        ║
 ║   Compatible: Claude Code, Cline, Antigravity        ║
 ║   Modelos: Fable 5, Haiku, Sonnet, Opus              ║
 ║                                                      ║
@@ -706,9 +627,7 @@ app.listen(PORT, () => {
 ║   GET  /dashboard       → http://localhost:${PORT}/dashboard
 ╚══════════════════════════════════════════════════════╝
 `);
-});
-
-process.on('SIGINT', () => { saveCacheToDisk(); console.log('\n[TokenOptimizer] Caché guardada.'); process.exit(0); });
-process.on('SIGTERM', () => { saveCacheToDisk(); process.exit(0); });
+  });
+}
 
 module.exports = app;

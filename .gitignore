@@ -1,0 +1,18 @@
+# Dependencias
+node_modules/
+
+# Artefactos en tiempo de ejecución (auto-generados)
+cache.json
+public/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Entorno
+.env
+.env.*
+
+# Sistema
+.DS_Store
+Thumbs.db
