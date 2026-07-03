@@ -21,6 +21,9 @@ const {
   supportsPrefill,
   supportsSampling,
   modelInputPricePerMTok,
+  estimateCostUSD,
+  responseCacheKey,
+  isResponseCacheable,
   hasClientCacheControl,
   generateConvId,
   extractLastUserText,
@@ -117,12 +120,20 @@ function addSavedTokens(tokens, model) {
 
 // ==================== PERSISTENCIA ====================
 let conversationCache = new Map();
+// Atribución por agente/worktree (cabecera x-agent-id): quién gasta y quién ahorra.
+let agentStats = new Map();
+// Caché de respuestas completas (opt-in x-cache-response). NO persiste a disco:
+// TTL corto y contenido potencialmente grande.
+const responseCache = new Map();
 let metrics = {
   totalRequests: 0,
   totalTokensSaved: 0,
   totalSavingsUSD: 0,
+  totalSpentUSD: 0,
+  totalResponseCacheHits: 0,
   totalBatchCalls: 0,
   totalCompressions: 0,
+  providers: {},
   startTime: Date.now(),
 };
 
@@ -131,8 +142,13 @@ function loadCacheFromDisk() {
     if (fs.existsSync(CONFIG.CACHE_FILE)) {
       const data = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, 'utf-8'));
       if (data.conversationCache) conversationCache = new Map(Object.entries(data.conversationCache));
+      if (data.agentStats) agentStats = new Map(Object.entries(data.agentStats));
       if (data.metrics) metrics = { ...metrics, ...data.metrics };
-      logger.info({ entries: conversationCache.size }, 'caché cargada desde disco');
+      // Métricas antiguas persistidas pueden no tener los campos nuevos.
+      metrics.providers = metrics.providers || {};
+      metrics.totalSpentUSD = metrics.totalSpentUSD || 0;
+      metrics.totalResponseCacheHits = metrics.totalResponseCacheHits || 0;
+      logger.info({ entries: conversationCache.size, agents: agentStats.size }, 'caché cargada desde disco');
     }
   } catch (err) {
     logger.error({ err }, 'error cargando caché');
@@ -143,6 +159,7 @@ function saveCacheToDisk() {
   try {
     fs.writeFileSync(CONFIG.CACHE_FILE, JSON.stringify({
       conversationCache: Object.fromEntries(conversationCache),
+      agentStats: Object.fromEntries(agentStats),
       metrics,
       lastSaved: new Date().toISOString(),
     }, null, 2));
@@ -159,8 +176,69 @@ setInterval(() => {
   for (const [k, v] of conversationCache) {
     if (now - v.timestamp > CONFIG.CACHE_TTL_MS) { conversationCache.delete(k); cleaned++; }
   }
+  for (const [k, v] of responseCache) {
+    if (now - v.timestamp > CONFIG.RESPONSE_CACHE_TTL_MS) responseCache.delete(k);
+  }
   if (cleaned > 0) { logger.info({ cleaned }, 'cachés expiradas eliminadas'); saveCacheToDisk(); }
 }, 60_000).unref();
+
+// ==================== ATRIBUCIÓN POR AGENTE Y PRESUPUESTOS ====================
+// Cabecera x-agent-id: etiqueta libre (worktree de Orca, nombre de agente...)
+// que agrupa gasto/ahorro. x-budget-usd: tope de gasto acumulado para esa etiqueta.
+
+function normalizeAgentId(req) {
+  const raw = req.headers['x-agent-id'];
+  if (!raw) return null;
+  return String(raw).slice(0, 120);
+}
+
+// Acumula uso por agente y el gasto global. `provider` distingue anthropic/openai/xai.
+function recordAgentUsage(agentId, { costUSD = 0, savedTokens = 0, inputTokens = 0, outputTokens = 0, provider = 'anthropic' } = {}) {
+  metrics.totalSpentUSD += costUSD;
+  if (!agentId) return;
+  const s = agentStats.get(agentId) || {
+    requests: 0, inputTokens: 0, outputTokens: 0, spentUSD: 0, savedTokens: 0, providers: {},
+  };
+  s.requests++;
+  s.inputTokens += inputTokens;
+  s.outputTokens += outputTokens;
+  s.spentUSD += costUSD;
+  s.savedTokens += savedTokens;
+  s.providers[provider] = (s.providers[provider] || 0) + 1;
+  s.lastSeen = Date.now();
+  agentStats.set(agentId, s);
+}
+
+// Devuelve true (y responde 402) si el gasto acumulado del agente supera el
+// presupuesto pedido. 402 y no 429: los SDKs reintentan 429 automáticamente y
+// reintentar un presupuesto agotado es inútil.
+// Nota: peticiones concurrentes pueden excederlo ligeramente (chequeo previo, no transaccional).
+function enforceBudget(req, res, agentId) {
+  const raw = req.headers['x-budget-usd'];
+  if (raw === undefined) return false;
+  const budget = parseFloat(raw);
+  if (!Number.isFinite(budget) || budget <= 0) {
+    res.status(400).json({ error: 'invalid_budget', message: 'x-budget-usd debe ser un número > 0.' });
+    return true;
+  }
+  if (!agentId) {
+    res.status(400).json({ error: 'missing_agent_id', message: 'x-budget-usd requiere x-agent-id (la etiqueta cuyo gasto se limita).' });
+    return true;
+  }
+  const spent = agentStats.get(agentId)?.spentUSD || 0;
+  if (spent >= budget) {
+    req.log?.warn({ agentId, spent, budget }, 'presupuesto agotado');
+    res.status(402).json({
+      error: 'budget_exceeded',
+      message: `Presupuesto agotado para "${agentId}": gastado $${spent.toFixed(4)} de $${budget}.`,
+      agent_id: agentId,
+      spent_usd: +spent.toFixed(4),
+      budget_usd: budget,
+    });
+    return true;
+  }
+  return false;
+}
 
 // ==================== COMPRESIÓN (parte impura) ====================
 // Evita lanzar dos compresiones simultáneas para la misma conversación.
@@ -285,6 +363,11 @@ app.post('/v1/messages', async (req, res) => {
   const clientStream = !!originalBody.stream;
   const optInAntiPreamble = req.headers['x-anti-preamble'] === 'true';
   const toolPruning = req.headers['x-tool-pruning'] === 'true' || CONFIG.TOOL_PRUNING_ENABLED;
+  const agentId = normalizeAgentId(req);
+  const wantsResponseCache = req.headers['x-cache-response'] === 'read-only';
+
+  // Presupuesto por agente: se corta ANTES de llamar a Anthropic.
+  if (enforceBudget(req, res, agentId)) return;
 
   // Si el cliente cierra la conexión, abortamos la llamada upstream para liberar recursos.
   const controller = new AbortController();
@@ -302,6 +385,26 @@ app.post('/v1/messages', async (req, res) => {
     // La caché de compresión se aísla por API key: sin esto, un cliente podría
     // leer el resumen de la conversación de OTRO usuario enviando su x-conversation-id.
     const keyScope = hashKey(apiKey);
+
+    // CACHÉ DE RESPUESTAS (opt-in, solo no-stream): para lecturas idempotentes que
+    // varios agentes repiten en un fan-out ("lee X y resume"). Clave = hash de la
+    // petición ORIGINAL normalizada, aislada por API key. Ahorra la llamada entera.
+    const respCacheKey = (wantsResponseCache && !clientStream) ? responseCacheKey(keyScope, originalBody) : null;
+    if (respCacheKey) {
+      const hit = responseCache.get(respCacheKey);
+      if (hit && Date.now() - hit.timestamp <= CONFIG.RESPONSE_CACHE_TTL_MS) {
+        hit.timestamp = Date.now(); // refresca TTL: sigue en uso
+        metrics.totalResponseCacheHits++;
+        // Se ahorró la llamada completa: entrada + salida al precio real del modelo.
+        const savedTok = (hit.usage?.input_tokens || 0) + (hit.usage?.cache_read_input_tokens || 0) + (hit.usage?.output_tokens || 0);
+        metrics.totalTokensSaved += savedTok;
+        metrics.totalSavingsUSD += hit.costUSD;
+        recordAgentUsage(agentId, { savedTokens: savedTok });
+        req.log.info({ agentId, savedTok }, 'hit de caché de respuestas');
+        res.setHeader('x-response-cache', 'hit');
+        return res.json(hit.response);
+      }
+    }
     const rawConvId = req.headers['x-conversation-id'] || generateConvId(messages);
     const convId = rawConvId.startsWith(`${keyScope}:`) ? rawConvId : `${keyScope}:${rawConvId}`;
     const lastUserText = extractLastUserText(messages);
@@ -385,6 +488,8 @@ app.post('/v1/messages', async (req, res) => {
       delete body.stream;
       const stream = client.messages.stream(body, { signal: controller.signal });
       let started = false;
+      // usage llega repartido: message_start trae entrada/caché, message_delta la salida.
+      const streamUsage = {};
       for await (const event of stream) {
         if (!started) {
           res.setHeader('Content-Type', 'text/event-stream');
@@ -394,14 +499,41 @@ app.post('/v1/messages', async (req, res) => {
           started = true;
         }
         if (event.type === 'message_start' && event.message?.usage) {
+          Object.assign(streamUsage, event.message.usage);
           addSavedTokens(tokensSavedFromUsage(event.message.usage), model);
         }
+        if (event.type === 'message_delta' && event.usage) Object.assign(streamUsage, event.usage);
         res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       }
       res.end();
+      recordAgentUsage(agentId, {
+        costUSD: estimateCostUSD(streamUsage, model),
+        savedTokens: tokensSavedFromUsage(streamUsage),
+        inputTokens: streamUsage.input_tokens || 0,
+        outputTokens: streamUsage.output_tokens || 0,
+      });
     } else {
       const response = await client.messages.create(body, { signal: controller.signal });
       addSavedTokens(tokensSavedFromUsage(response.usage), model);
+      recordAgentUsage(agentId, {
+        costUSD: estimateCostUSD(response.usage, model),
+        savedTokens: tokensSavedFromUsage(response.usage),
+        inputTokens: response.usage?.input_tokens || 0,
+        outputTokens: response.usage?.output_tokens || 0,
+      });
+      // Guardar en la caché de respuestas solo terminaciones limpias de texto.
+      if (respCacheKey && isResponseCacheable(response)) {
+        if (responseCache.size >= CONFIG.RESPONSE_CACHE_MAX) {
+          responseCache.delete(responseCache.keys().next().value); // evicción del más antiguo
+        }
+        responseCache.set(respCacheKey, {
+          response,
+          usage: response.usage,
+          costUSD: estimateCostUSD(response.usage, model),
+          timestamp: Date.now(),
+        });
+        res.setHeader('x-response-cache', 'stored');
+      }
       res.json(response);
     }
 
@@ -516,6 +648,97 @@ app.post('/v1/batch/auto', async (req, res) => {
   }
 });
 
+// ==================== PASSTHROUGH MULTIPROVEEDOR ====================
+// tokeriZen como puerta única de la flota: el tráfico OpenAI/xAI se reenvía TAL CUAL
+// (sin optimizar — hablan otro protocolo) pero se MIDE: peticiones y tokens por
+// proveedor y por agente (x-agent-id). Los clientes apuntan su base URL aquí:
+//   OPENAI_BASE_URL=http://localhost:8080/openai/v1
+//   XAI_BASE_URL=http://localhost:8080/xai/v1
+const PROVIDERS = {
+  openai: { envBase: 'OPENAI_UPSTREAM', defaultBase: 'https://api.openai.com', envKey: 'OPENAI_API_KEY' },
+  xai: { envBase: 'XAI_UPSTREAM', defaultBase: 'https://api.x.ai', envKey: 'XAI_API_KEY' },
+};
+
+function meterProvider(name, agentId, inputTokens, outputTokens) {
+  const pm = metrics.providers[name] || (metrics.providers[name] = { requests: 0, inputTokens: 0, outputTokens: 0 });
+  pm.requests++;
+  pm.inputTokens += inputTokens;
+  pm.outputTokens += outputTokens;
+  // Se registran tokens, no USD: no mantenemos tabla de precios de terceros.
+  recordAgentUsage(agentId, { inputTokens, outputTokens, provider: name });
+}
+
+function providerHandler(name) {
+  const p = PROVIDERS[name];
+  return async (req, res) => {
+    const agentId = normalizeAgentId(req);
+    if (enforceBudget(req, res, agentId)) return;
+
+    // El upstream se lee en cada petición (no al arrancar) para poder apuntarlo
+    // a un mock en tests o cambiarlo sin reiniciar.
+    const base = (process.env[p.envBase] || p.defaultBase).replace(/\/$/, '');
+    const url = base + req.originalUrl.replace(new RegExp(`^/${name}`), '');
+
+    const controller = new AbortController();
+    const onClose = () => { if (!res.writableEnded) controller.abort(); };
+    res.once('close', onClose);
+
+    const headers = { 'content-type': 'application/json' };
+    const auth = req.headers['authorization'] || (process.env[p.envKey] ? `Bearer ${process.env[p.envKey]}` : undefined);
+    if (auth) headers.authorization = auth;
+
+    try {
+      const hasBody = !['GET', 'HEAD'].includes(req.method);
+      const upstream = await fetch(url, {
+        method: req.method,
+        headers,
+        body: hasBody ? JSON.stringify(req.body || {}) : undefined,
+        signal: controller.signal,
+      });
+
+      res.status(upstream.status);
+      const ct = upstream.headers.get('content-type') || '';
+
+      if (ct.includes('text/event-stream')) {
+        // Streaming: passthrough binario + escaneo del final en busca del usage
+        // (OpenAI lo emite en el último chunk si el cliente pidió include_usage).
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        const reader = upstream.body.getReader();
+        const decoder = new TextDecoder();
+        let tail = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+          tail = (tail + decoder.decode(value, { stream: true })).slice(-4000);
+        }
+        res.end();
+        const m = tail.match(/"prompt_tokens"\s*:\s*(\d+)[\s\S]*?"completion_tokens"\s*:\s*(\d+)/);
+        meterProvider(name, agentId, m ? +m[1] : 0, m ? +m[2] : 0);
+      } else {
+        res.setHeader('Content-Type', ct || 'application/json');
+        const text = await upstream.text();
+        res.send(text);
+        let usage = null;
+        try { usage = JSON.parse(text).usage; } catch (_) { /* no-JSON */ }
+        meterProvider(name, agentId, usage?.prompt_tokens || 0, usage?.completion_tokens || 0);
+      }
+    } catch (err) {
+      if (controller.signal.aborted) { try { res.end(); } catch (_) {} return; }
+      req.log?.error({ err, provider: name, url }, 'error en passthrough');
+      if (!res.headersSent) res.status(502).json({ error: 'upstream_error', provider: name, message: err.message });
+      else { try { res.end(); } catch (_) {} }
+    } finally {
+      res.removeListener('close', onClose);
+    }
+  };
+}
+
+// Mismo rate limiter que /v1 (comparten store) y un handler por proveedor.
+app.use('/openai/v1', apiLimiter, providerHandler('openai'));
+app.use('/xai/v1', apiLimiter, providerHandler('xai'));
+
 // ==================== HEALTH / STATS / DASHBOARD ====================
 app.get('/health', (req, res) => res.json({
   status: shuttingDown ? 'shutting_down' : 'ok',
@@ -531,10 +754,18 @@ app.get('/stats', (req, res) => {
     age: Date.now() - d.timestamp,
     summaryLength: d.summary?.length || 0,
   }));
+  // Desglose por agente/worktree (x-agent-id), gastos redondeados para lectura.
+  const agents = {};
+  for (const [id, s] of Array.from(agentStats.entries()).slice(0, 50)) {
+    agents[id] = { ...s, spentUSD: +s.spentUSD.toFixed(4) };
+  }
   res.json({
     ...metrics,
+    totalSpentUSD: +metrics.totalSpentUSD.toFixed(4),
     activeCaches: conversationCache.size,
     cacheEntries: cacheEntries.slice(0, 10),
+    responseCacheEntries: responseCache.size,
+    agents,
     uptime: process.uptime(),
     memoryUsage: process.memoryUsage(),
     // USD acumulado con el precio real de cada modelo; fallback a $3/M para
@@ -584,7 +815,7 @@ if (require.main === module) {
   httpServer = app.listen(PORT, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════╗
-║   🦊 Claude Token Optimizer v3.3 (Producción)        ║
+║   🦊 Claude Token Optimizer v3.4 (Producción)        ║
 ║   Compatible: Claude Code, Cline, Antigravity        ║
 ║   Modelos: Fable 5, Haiku, Sonnet, Opus              ║
 ║                                                      ║

@@ -1,4 +1,4 @@
-# 🦊 Claude Token Optimizer v3.3
+# 🦊 Claude Token Optimizer v3.4
 
 **Proxy inteligente para la API de Anthropic compatible con Fable 5, Haiku, Sonnet y Opus.**
 
@@ -31,6 +31,9 @@ Este README cubre instalación, configuración, endpoints y operación básica.
 | **Prefill Detection** | Inyecta un mensaje `assistant` de prefijo (`{`, `-`, ` ``` `); desactivado en bucles de tools **y en modelos que lo rechazan** (Fable 5 y familia 4.6+) | ✅ Activo |
 | **Batch de Tareas** | Fusiona hasta 8 prompts independientes en una llamada (manual + automático) | ✅ Activo |
 | **Saneamiento por modelo** | Elimina automáticamente parámetros que la API rechazaría con 400 según el modelo: `thinking: disabled` en Fable 5, `temperature`/`top_p`/`top_k` en Fable 5 / Opus 4.7+/ Sonnet 5, prefill en la familia 4.6+ | ✅ Activo |
+| **Atribución por agente + presupuestos** | Etiqueta cada petición con `x-agent-id` (worktrees de Orca, sub-agentes…) y acumula gasto/ahorro por etiqueta; `x-budget-usd` corta con `402` cuando el gasto acumulado supera el presupuesto | ✅ Activo (etiquetado opcional) |
+| **Caché de respuestas** | Respuestas completas cacheadas para peticiones idempotentes repetidas (fan-out de varios agentes leyendo lo mismo); aislada por API key, TTL 5 min | ⚙️ Opt-in (`x-cache-response`) |
+| **Passthrough multiproveedor** | Reenvía tráfico OpenAI/xAI tal cual (sin optimizar) pero **midiendo** peticiones y tokens por proveedor y por agente: un único plano de observabilidad para toda la flota | ✅ Activo (`/openai/v1`, `/xai/v1`) |
 | **Tool Schema Pruning** | Elimina herramientas no mencionadas en el prompt | ⚙️ Opt-in (`x-tool-pruning`) |
 | **Anti-preamble** | Fuerza salida directa y `[FIN]` como stop sequence | ⚙️ Opt-in (`x-anti-preamble`) |
 
@@ -79,6 +82,11 @@ El proxy estará escuchando en `http://localhost:8080`.
 | `MAX_RETRIES` | Reintentos del SDK ante fallos transitorios | `2` |
 | `RATE_LIMIT_WINDOW_MS` | Ventana del rate limiter | `60000` |
 | `RATE_LIMIT_MAX` | Máx. peticiones por API key/ventana | `120` |
+| `RESPONSE_CACHE_TTL_MS` | TTL de la caché de respuestas (`x-cache-response`) | `300000` |
+| `RESPONSE_CACHE_MAX` | Máx. entradas de la caché de respuestas | `500` |
+| `OPENAI_UPSTREAM` | Upstream del passthrough OpenAI | `https://api.openai.com` |
+| `XAI_UPSTREAM` | Upstream del passthrough xAI | `https://api.x.ai` |
+| `OPENAI_API_KEY` / `XAI_API_KEY` | Keys de respaldo para el passthrough (si el cliente no envía `Authorization`) | — |
 | `LOG_LEVEL` | Nivel de log (`trace`…`fatal`) | `info` |
 | `NODE_ENV` | `production` → logs JSON; si no, salida legible (pino-pretty) | — |
 
@@ -149,6 +157,9 @@ curl -X POST http://localhost:8080/v1/messages \
 | `x-skip-compression` | Omite la compresión de historial en esta petición |
 | `x-tool-pruning` | `true` para activar el pruning de herramientas (opt-in) |
 | `x-anti-preamble` | `true` para forzar salida directa + stop `[FIN]` (opt-in). **Se ignora si la petición lleva `tools`**, porque el stop `[FIN]` podría cortar una cadena de `tool_use` a medias |
+| `x-agent-id` | Etiqueta libre (máx. 120 chars) que agrupa gasto/ahorro por agente o worktree. Aparece en `/stats.agents` y en el dashboard |
+| `x-budget-usd` | Tope de gasto acumulado (USD) para el `x-agent-id` de la petición. Si ya se superó, responde `402 budget_exceeded` **sin llamar a Anthropic**. Requiere `x-agent-id`. El chequeo es previo, no transaccional: peticiones concurrentes pueden excederlo ligeramente |
+| `x-cache-response` | `read-only` para activar la caché de respuestas en esta petición (solo no-stream). Úsala **solo en lecturas idempotentes** ("lee X y resume"), nunca para generación de código. Solo se cachean terminaciones limpias (`end_turn`/`stop_sequence`) |
 
 **Cabeceras de respuesta:**
 
@@ -156,6 +167,7 @@ curl -X POST http://localhost:8080/v1/messages \
 |----------|-------------|
 | `x-compressed` | `true` si se aplicó compresión de historial |
 | `x-conversation-id` | ID con el que se cacheó el resumen |
+| `x-response-cache` | `hit` (respuesta servida desde la caché, sin llamar a Anthropic) o `stored` (respuesta guardada para próximas peticiones idénticas) |
 
 ---
 
@@ -218,9 +230,30 @@ Respuesta (tras procesar la cola):
 
 ---
 
+### `ANY /openai/v1/*` y `ANY /xai/v1/*` — passthrough multiproveedor
+
+tokeriZen como **puerta única de la flota**: el tráfico hacia OpenAI y xAI se reenvía **tal cual** (sin optimizar — hablan otro protocolo) pero se **mide**: peticiones y tokens por proveedor y por `x-agent-id`. Así un montaje multi-agente (p. ej. Orca con Claude Code + Codex + Grok) tiene un único plano de coste y observabilidad.
+
+Apunta los clientes así:
+
+```bash
+# Agentes OpenAI (Codex CLI, etc.)
+export OPENAI_BASE_URL="http://localhost:8080/openai/v1"
+# Agentes xAI (Grok CLI, etc.)
+export XAI_BASE_URL="http://localhost:8080/xai/v1"
+```
+
+- La cabecera `Authorization` del cliente se reenvía; si no la envía, se usa `OPENAI_API_KEY`/`XAI_API_KEY` del servidor como respaldo.
+- Soporta streaming (SSE) con passthrough binario; el `usage` se captura del último chunk cuando el cliente pide `stream_options: {include_usage: true}`.
+- Se miden **tokens, no USD** (no mantenemos tabla de precios de terceros).
+- `x-agent-id` y `x-budget-usd` también funcionan aquí (el presupuesto limita el gasto **Claude** acumulado de esa etiqueta).
+- Comparte el rate limiter de `/v1`.
+
+---
+
 ### `GET /stats`
 
-Métricas de uso en formato JSON.
+Métricas de uso en formato JSON: contadores globales, `totalSpentUSD` (gasto Claude estimado), `agents` (desglose por `x-agent-id`), `providers` (peticiones/tokens de OpenAI y xAI) y `totalResponseCacheHits`.
 
 ```bash
 curl http://localhost:8080/stats
@@ -392,6 +425,18 @@ Basado en pruebas internas con conversaciones de desarrollo típicas (50–100 t
 ---
 
 ## 📝 Changelog
+
+### v3.4.0 (2026-07-03)
+
+**Pensada para flotas multi-agente (Orca, orquestadores, sub-agentes):**
+
+- **Atribución por agente (`x-agent-id`):** cada petición puede etiquetarse con el worktree/agente que la origina; `/stats.agents` y el panel "Flota por agente" del dashboard muestran peticiones, tokens in/out, gasto USD (precio real por modelo, incluidas tarifas de caché 0.1×/1.25×) y tokens ahorrados por etiqueta.
+- **Presupuestos (`x-budget-usd`):** tope de gasto acumulado por etiqueta. Al superarse responde `402 budget_exceeded` sin llamar a Anthropic (402 y no 429: los SDKs reintentan 429 y reintentar un presupuesto agotado es inútil). Requiere `x-agent-id`; chequeo previo, no transaccional.
+- **Caché de respuestas (`x-cache-response: read-only`):** cachea la respuesta completa de peticiones idempotentes repetidas — el caso real de ahorro en un fan-out donde N agentes piden la misma lectura. Aislada por API key, clave por hash normalizado de la petición (independiente del orden de claves JSON), TTL 5 min, solo `end_turn`/`stop_sequence`, solo no-stream. Un hit ahorra la llamada entera y se contabiliza como ahorro real.
+- **Passthrough multiproveedor (`/openai/v1/*`, `/xai/v1/*`):** reenvío transparente a OpenAI/xAI con medición de peticiones y tokens por proveedor y por agente (streaming incluido). Un solo dashboard para toda la flota. Errores de upstream → `502 upstream_error`.
+- **Gasto real (`totalSpentUSD`):** además del ahorro, ahora se estima el gasto Claude de cada respuesta (entrada + caché leída×0.1 + caché escrita×1.25 + salida, por precios de familia) — visible en el dashboard.
+- Nuevas variables: `RESPONSE_CACHE_TTL_MS`, `RESPONSE_CACHE_MAX`, `OPENAI_UPSTREAM`, `XAI_UPSTREAM`, `OPENAI_API_KEY`, `XAI_API_KEY`.
+- 12 tests nuevos (63 en total): atribución, presupuestos, caché de respuestas (hit/aislamiento por key), passthrough con upstream mockeado y manejo de upstream caído.
 
 ### v3.3.0 (2026-07-02)
 

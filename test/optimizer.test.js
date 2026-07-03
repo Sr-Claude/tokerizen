@@ -65,6 +65,55 @@ test('modelInputPricePerMTok: precio por familia de modelo', () => {
   assert.equal(O.modelInputPricePerMTok('modelo-desconocido'), 3);
 });
 
+// ==================== estimateCostUSD ====================
+test('estimateCostUSD: pondera entrada, caché (0.1x/1.25x) y salida por familia', () => {
+  const usage = { input_tokens: 1000, cache_read_input_tokens: 1000, cache_creation_input_tokens: 1000, output_tokens: 1000 };
+  // Sonnet: in $3/M, out $15/M → (3 + 0.3 + 3.75 + 15) / 1000 = 0.02205
+  assert.ok(Math.abs(O.estimateCostUSD(usage, 'claude-sonnet-4-6') - 0.02205) < 1e-9);
+  // Haiku: in $1/M, out $5/M → (1 + 0.1 + 1.25 + 5) / 1000 = 0.00735
+  assert.ok(Math.abs(O.estimateCostUSD(usage, 'claude-haiku-4-5') - 0.00735) < 1e-9);
+  assert.equal(O.estimateCostUSD(null, 'claude-sonnet-4-6'), 0);
+  assert.equal(O.estimateCostUSD({}, 'claude-sonnet-4-6'), 0);
+});
+
+test('modelOutputPricePerMTok: precio de salida por familia', () => {
+  assert.equal(O.modelOutputPricePerMTok('claude-fable-5'), 50);
+  assert.equal(O.modelOutputPricePerMTok('claude-opus-4-8'), 25);
+  assert.equal(O.modelOutputPricePerMTok('claude-sonnet-5'), 15);
+  assert.equal(O.modelOutputPricePerMTok('claude-haiku-4-5'), 5);
+});
+
+// ==================== stableStringify / responseCacheKey ====================
+test('stableStringify: independiente del orden de claves', () => {
+  assert.equal(
+    O.stableStringify({ b: 1, a: { d: 2, c: 3 } }),
+    O.stableStringify({ a: { c: 3, d: 2 }, b: 1 })
+  );
+  assert.equal(O.stableStringify([1, 'x', null]), '[1,"x",null]');
+  assert.equal(O.stableStringify({ a: undefined, b: 1 }), '{"b":1}');
+});
+
+test('responseCacheKey: ignora stream/metadata, distingue ámbito y contenido', () => {
+  const body = { model: 'claude-haiku-4-5', max_tokens: 100, messages: [{ role: 'user', content: 'lee X' }] };
+  const k1 = O.responseCacheKey('scopeA', body);
+  // stream y metadata no cambian la clave
+  assert.equal(O.responseCacheKey('scopeA', { ...body, stream: true, metadata: { u: '1' } }), k1);
+  // el orden de claves tampoco
+  assert.equal(O.responseCacheKey('scopeA', { messages: body.messages, max_tokens: 100, model: body.model }), k1);
+  // ámbito distinto (otra API key) o contenido distinto → clave distinta
+  assert.notEqual(O.responseCacheKey('scopeB', body), k1);
+  assert.notEqual(O.responseCacheKey('scopeA', { ...body, max_tokens: 200 }), k1);
+});
+
+test('isResponseCacheable: solo terminaciones limpias', () => {
+  assert.equal(O.isResponseCacheable({ stop_reason: 'end_turn' }), true);
+  assert.equal(O.isResponseCacheable({ stop_reason: 'stop_sequence' }), true);
+  assert.equal(O.isResponseCacheable({ stop_reason: 'tool_use' }), false);
+  assert.equal(O.isResponseCacheable({ stop_reason: 'max_tokens' }), false);
+  assert.equal(O.isResponseCacheable({ stop_reason: 'refusal' }), false);
+  assert.equal(O.isResponseCacheable(null), false);
+});
+
 // ==================== hasClientCacheControl ====================
 test('hasClientCacheControl: detecta breakpoints del cliente en system, tools o messages', () => {
   assert.equal(O.hasClientCacheControl('texto plano', [], []), false);

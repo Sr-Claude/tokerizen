@@ -22,7 +22,7 @@ El proxy se sitúa entre tu cliente (Claude Code, Cline, script propio…) y la 
                                    └──────────────────┘
 ```
 
-**Separación pura / impura.** Toda la lógica de decisión vive en [`lib/optimizer.js`](../lib/optimizer.js) como funciones **puras** (entrada → salida, sin efectos), lo que las hace triviales de testear sin red. [`server.js`](../server.js) es la capa **impura**: HTTP, llamadas al SDK, estado en memoria y persistencia. Esta frontera es la razón de que haya 51 tests sin tocar la red.
+**Separación pura / impura.** Toda la lógica de decisión vive en [`lib/optimizer.js`](../lib/optimizer.js) como funciones **puras** (entrada → salida, sin efectos), lo que las hace triviales de testear sin red. [`server.js`](../server.js) es la capa **impura**: HTTP, llamadas al SDK, estado en memoria y persistencia. Esta frontera es la razón de que haya 63 tests sin tocar la red.
 
 ---
 
@@ -32,14 +32,18 @@ Cuando llega un `POST /v1/messages`, el handler de [`server.js`](../server.js) a
 
 | # | Paso | Función | Efecto |
 |:-:|------|---------|--------|
+| 0 | Presupuesto por agente | `enforceBudget` | Corta con `402` si el gasto acumulado del `x-agent-id` supera `x-budget-usd` (antes de gastar nada) |
 | 1 | Validación + convId | `generateConvId`, `hashKey` | Rechaza `messages` no-array; deriva el ID de conversación aislado por API key |
-| 2 | Tool pruning *(opt-in)* | `pruneTools` | Elimina herramientas no mencionadas |
-| 3 | Dynamic max tokens | `calculateMaxTokens` | Ajusta el techo de salida según la intención |
-| 4 | Compresión de historial | `compressHistory` (async) + `applyCompression` | Resume conversaciones largas |
-| 5 | Prefill detection | `detectAndApplyPrefill` | Inyecta prefijo `assistant` para saltar el preámbulo |
-| 6 | Anti-preamble *(opt-in)* | — | Añade instrucción + stop `[FIN]` |
-| 7 | Saneamiento por modelo | `supportsSampling`, `isFable5Model` | Quita parámetros que darían 400 |
-| 8 | Caché asimétrica | `injectAsymmetricCache` / `hasClientCacheControl` | Coloca `cache_control` en el prefijo estable |
+| 2 | Caché de respuestas *(opt-in)* | `responseCacheKey` | Si hay hit, devuelve la respuesta cacheada y **termina aquí** (0 llamadas a Anthropic) |
+| 3 | Tool pruning *(opt-in)* | `pruneTools` | Elimina herramientas no mencionadas |
+| 4 | Dynamic max tokens | `calculateMaxTokens` | Ajusta el techo de salida según la intención |
+| 5 | Compresión de historial | `compressHistory` (async) + `applyCompression` | Resume conversaciones largas |
+| 6 | Prefill detection | `detectAndApplyPrefill` | Inyecta prefijo `assistant` para saltar el preámbulo |
+| 7 | Anti-preamble *(opt-in)* | — | Añade instrucción + stop `[FIN]` |
+| 8 | Saneamiento por modelo | `supportsSampling`, `isFable5Model` | Quita parámetros que darían 400 |
+| 9 | Caché asimétrica | `injectAsymmetricCache` / `hasClientCacheControl` | Coloca `cache_control` en el prefijo estable |
+
+Tras la respuesta, se contabiliza el **ahorro** (`addSavedTokens`) y el **gasto** (`estimateCostUSD` + `recordAgentUsage`), y en no-stream se guarda en la caché de respuestas si procede.
 
 Después se llama a `client.messages.create()` (o `.stream()`), se contabiliza el ahorro y se devuelve la respuesta.
 
@@ -180,6 +184,45 @@ Los patrones viven en `CONFIG.NO_PREFILL_PATTERN` y `CONFIG.NO_SAMPLING_PATTERN`
 
 ---
 
+## Capacidades de flota (v3.4)
+
+Pensadas para montajes multi-agente (Orca, orquestadores con sub-agentes): varios agentes en paralelo apuntando al mismo proxy.
+
+### 8. Atribución por agente + presupuestos (`x-agent-id`, `x-budget-usd`)
+
+Cada petición puede llevar una etiqueta libre `x-agent-id` (el worktree de Orca, el nombre del sub-agente…). El proxy acumula por etiqueta: peticiones, tokens in/out, **gasto USD estimado** y tokens ahorrados. El gasto se calcula con `estimateCostUSD(usage, model)`, que pondera cada componente al precio real de la familia: entrada, caché leída (0.1×), caché escrita (1.25×) y salida (Fable $10/$50, Opus $5/$25, Sonnet $3/$15, Haiku $1/$5 por MTok).
+
+`x-budget-usd` fija un tope de gasto acumulado para esa etiqueta: si ya se superó, el proxy responde **`402 budget_exceeded` sin llamar a Anthropic**. Se eligió 402 y no 429 porque los SDKs reintentan automáticamente los 429, y reintentar un presupuesto agotado es inútil. Matices:
+
+- Requiere `x-agent-id` (400 si falta): el presupuesto necesita saber qué cubo limitar.
+- El chequeo es **previo, no transaccional**: N peticiones concurrentes pueden excederlo ligeramente.
+- El desglose vive en `/stats.agents` y en el panel "Flota por agente" del dashboard; se persiste en `cache.json`.
+
+### 9. Caché de respuestas (`x-cache-response: read-only`)
+
+La caché de prefijos de Anthropic **no** ayuda entre agentes distintos (cada uno tiene su propio prefijo). Pero en un fan-out competitivo, N agentes suelen repetir la **misma lectura** ("lee package.json y resume"). El proxy es el único punto donde eso se puede deduplicar: cachea la **respuesta completa** y la reproduce sin llamar a Anthropic.
+
+Diseño conservador a propósito:
+
+- **Opt-in por petición** y pensada solo para lecturas idempotentes — nunca para generación de código (misma pregunta → misma respuesta es lo deseado en una lectura, no en una generación).
+- **Clave** = SHA-256 de `hash(api_key) + petición normalizada` (`stableStringify`: claves JSON ordenadas recursivamente, ignora `stream`/`metadata`). El ámbito por API key evita que dos usuarios compartan respuestas.
+- Solo **no-stream**, y solo se guardan terminaciones limpias (`end_turn`/`stop_sequence` — nunca `tool_use`, `refusal` ni truncados).
+- TTL 5 min (`RESPONSE_CACHE_TTL_MS`), cota de 500 entradas con evicción del más antiguo, **no** persiste a disco.
+- Un hit devuelve `x-response-cache: hit`, cuenta la llamada entera como ahorro (entrada + salida al precio del modelo) y refresca el TTL.
+
+### 10. Passthrough multiproveedor (`/openai/v1/*`, `/xai/v1/*`)
+
+Para que tokeriZen sea la **puerta única de la flota** aunque haya agentes no-Claude: el tráfico OpenAI/xAI se reenvía **tal cual** (hablan otro protocolo — no se optimiza) pero se **mide**: peticiones y tokens por proveedor y por `x-agent-id`, visibles en `/stats.providers` y el dashboard.
+
+- Los clientes apuntan su base URL al proxy: `OPENAI_BASE_URL=http://proxy:8080/openai/v1`, `XAI_BASE_URL=http://proxy:8080/xai/v1`.
+- `Authorization` del cliente se reenvía; `OPENAI_API_KEY`/`XAI_API_KEY` del servidor actúan de respaldo.
+- Streaming SSE con passthrough binario; el `usage` se extrae del último chunk cuando el cliente pidió `stream_options: {include_usage: true}`.
+- Se miden **tokens, no USD** (sin tabla de precios de terceros).
+- El upstream se lee de `OPENAI_UPSTREAM`/`XAI_UPSTREAM` **en cada petición** — así los tests lo apuntan a un mock sin reiniciar.
+- Upstream caído → `502 upstream_error`; comparte rate limiter con `/v1`.
+
+---
+
 ## Técnica extra: Anti-preamble *(opt-in — `x-anti-preamble`)*
 
 Con `x-anti-preamble: true`, añade al system prompt una instrucción de salida directa y `[FIN]` como stop sequence (`ANTI_PREAMBLE_PROMPT`, `DEFAULT_STOP_SEQUENCE`). **Se ignora si la petición lleva `tools`**: el stop `[FIN]` podría cortar una cadena de `tool_use` a medias. Como el pruning, modifica el comportamiento del modelo y va desactivado por defecto.
@@ -191,11 +234,13 @@ Con `x-anti-preamble: true`, añade al system prompt una instrucción de salida 
 Todo el estado vive **en memoria** (un solo proceso):
 
 - `conversationCache` — resúmenes de compresión, con TTL de 5 min (`CACHE_TTL_MS`), limpiados cada minuto.
-- `metrics` — contadores acumulados (`totalRequests`, `totalTokensSaved`, `totalSavingsUSD`, `totalBatchCalls`, `totalCompressions`).
+- `agentStats` — desglose por `x-agent-id`: peticiones, tokens, gasto USD, ahorro, proveedores.
+- `responseCache` — respuestas completas cacheadas (opt-in), TTL 5 min, máx. 500 entradas, **no** persiste.
+- `metrics` — contadores acumulados (`totalRequests`, `totalTokensSaved`, `totalSavingsUSD`, `totalSpentUSD`, `totalResponseCacheHits`, `totalBatchCalls`, `totalCompressions`, `providers`).
 - `batchQueues` — colas de batch automático.
 - `clientCache` — instancias del SDK por API key, con evicción del más antiguo al llegar a 100.
 
-**Persistencia:** `conversationCache` y `metrics` se vuelcan a `cache.json` cada 30 s y en el apagado, y se recargan al arrancar.
+**Persistencia:** `conversationCache`, `agentStats` y `metrics` se vuelcan a `cache.json` cada 30 s y en el apagado, y se recargan al arrancar. La caché de respuestas es solo-memoria.
 
 **Métrica de ahorro.** El ahorro por caché es real: `tokensSavedFromUsage` calcula ~90% de `cache_read_input_tokens` (dato que devuelve la propia API). `addSavedTokens(tokens, model)` acumula esos tokens **y** su valor en USD al precio de entrada real del modelo (`modelInputPricePerMTok`: Fable $10/M, Opus $5/M, Sonnet $3/M, Haiku $1/M).
 

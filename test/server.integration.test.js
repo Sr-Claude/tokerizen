@@ -336,6 +336,160 @@ test('compresión asíncrona: no bloquea la 1ª petición y se aplica en la 2ª'
   assert.ok(sent.messages.length < msgs.length);
 });
 
+test('atribución por agente: x-agent-id acumula gasto y aparece en /stats', async () => {
+  state.createImpl = async () => ({
+    id: 'msg_agent', type: 'message', role: 'assistant',
+    content: [{ type: 'text', text: 'ok' }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 1000, cache_read_input_tokens: 0, output_tokens: 500 },
+  });
+  const res = await request('POST', '/v1/messages', {
+    headers: { 'x-api-key': 'k-agent', 'x-agent-id': 'worktree-1' },
+    body: { model: 'claude-sonnet-4-6', max_tokens: 1000, messages: [{ role: 'user', content: 'analiza esto con detalle por favor' }] },
+  });
+  assert.equal(res.status, 200);
+
+  const stats = await request('GET', '/stats');
+  const a = stats.json.agents['worktree-1'];
+  assert.ok(a, 'el agente aparece en /stats');
+  assert.ok(a.requests >= 1);
+  assert.equal(a.inputTokens >= 1000, true);
+  // Sonnet: 1000 in * $3/M + 500 out * $15/M = 0.003 + 0.0075 = 0.0105
+  assert.ok(a.spentUSD >= 0.0105 - 1e-6);
+  assert.ok(stats.json.totalSpentUSD > 0);
+});
+
+test('presupuesto: 402 cuando el gasto acumulado supera x-budget-usd, sin llamar al SDK', async () => {
+  state.createImpl = async () => ({
+    id: 'msg_b', type: 'message', role: 'assistant',
+    content: [{ type: 'text', text: 'ok' }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 10000, output_tokens: 1000 },
+  });
+  const body = { model: 'claude-sonnet-4-6', max_tokens: 500, messages: [{ role: 'user', content: 'haz un análisis largo del proyecto' }] };
+
+  // 1ª petición: registra gasto (~$0.045)
+  const r1 = await request('POST', '/v1/messages', {
+    headers: { 'x-api-key': 'k-budget', 'x-agent-id': 'wt-budget' }, body,
+  });
+  assert.equal(r1.status, 200);
+
+  // 2ª petición con presupuesto por debajo del gasto → 402 y el SDK NO se llama
+  const callsBefore = state.calls.length;
+  const r2 = await request('POST', '/v1/messages', {
+    headers: { 'x-api-key': 'k-budget', 'x-agent-id': 'wt-budget', 'x-budget-usd': '0.001' }, body,
+  });
+  assert.equal(r2.status, 402);
+  assert.equal(r2.json.error, 'budget_exceeded');
+  assert.ok(r2.json.spent_usd > 0.001);
+  assert.equal(state.calls.length, callsBefore);
+});
+
+test('presupuesto: x-budget-usd sin x-agent-id -> 400', async () => {
+  const res = await request('POST', '/v1/messages', {
+    headers: { 'x-api-key': 'k-budget2', 'x-budget-usd': '5' },
+    body: { model: 'claude-sonnet-4-6', max_tokens: 100, messages: [{ role: 'user', content: 'hola' }] },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.json.error, 'missing_agent_id');
+});
+
+test('caché de respuestas: 2ª petición idéntica es hit y no llama al SDK', async () => {
+  state.createImpl = async () => ({
+    id: 'msg_rc', type: 'message', role: 'assistant',
+    content: [{ type: 'text', text: 'contenido de package.json resumido' }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 800, output_tokens: 120 },
+  });
+  const headers = { 'x-api-key': 'k-rcache', 'x-cache-response': 'read-only' };
+  const body = { model: 'claude-haiku-4-5', max_tokens: 300, messages: [{ role: 'user', content: 'lee package.json y resume la estructura del proyecto' }] };
+
+  const r1 = await request('POST', '/v1/messages', { headers, body });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.headers['x-response-cache'], 'stored');
+  const callsAfterFirst = state.calls.length;
+
+  const r2 = await request('POST', '/v1/messages', { headers, body });
+  assert.equal(r2.status, 200);
+  assert.equal(r2.headers['x-response-cache'], 'hit');
+  assert.equal(r2.json.id, 'msg_rc');                 // respuesta idéntica reproducida
+  assert.equal(state.calls.length, callsAfterFirst);  // el SDK no se llamó otra vez
+
+  // Otra API key = otro ámbito → NO comparte la respuesta cacheada
+  const r3 = await request('POST', '/v1/messages', {
+    headers: { 'x-api-key': 'k-rcache-OTRO', 'x-cache-response': 'read-only' }, body,
+  });
+  assert.equal(r3.headers['x-response-cache'], 'stored'); // miss + guardado
+  assert.equal(state.calls.length, callsAfterFirst + 1);
+});
+
+test('caché de respuestas: sin la cabecera no se cachea nada', async () => {
+  state.createImpl = async () => ({
+    id: 'msg_nc', content: [{ type: 'text', text: 'x' }], stop_reason: 'end_turn', usage: {},
+  });
+  const body = { model: 'claude-haiku-4-5', max_tokens: 100, messages: [{ role: 'user', content: 'pregunta sin cachear ninguna' }] };
+  const r1 = await request('POST', '/v1/messages', { headers: { 'x-api-key': 'k-nocache' }, body });
+  assert.equal(r1.headers['x-response-cache'], undefined);
+  const n = state.calls.length;
+  await request('POST', '/v1/messages', { headers: { 'x-api-key': 'k-nocache' }, body });
+  assert.equal(state.calls.length, n + 1); // siempre va al SDK
+});
+
+test('passthrough OpenAI: reenvía, mide tokens por proveedor y por agente', async () => {
+  // Upstream falso que se hace pasar por api.openai.com
+  const fake = http.createServer((q, s) => {
+    let data = '';
+    q.on('data', (d) => { data += d; });
+    q.on('end', () => {
+      const received = JSON.parse(data);
+      s.setHeader('content-type', 'application/json');
+      s.end(JSON.stringify({
+        id: 'cmpl-fake',
+        object: 'chat.completion',
+        model: received.model,
+        choices: [{ message: { role: 'assistant', content: 'hola desde openai falso' } }],
+        usage: { prompt_tokens: 42, completion_tokens: 17 },
+      }));
+    });
+  });
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+  process.env.OPENAI_UPSTREAM = `http://127.0.0.1:${fake.address().port}`;
+
+  try {
+    const res = await request('POST', '/openai/v1/chat/completions', {
+      headers: { authorization: 'Bearer sk-openai-test', 'x-agent-id': 'worktree-codex' },
+      body: { model: 'gpt-x', messages: [{ role: 'user', content: 'hola' }] },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.id, 'cmpl-fake');
+
+    const stats = await request('GET', '/stats');
+    assert.equal(stats.json.providers.openai.requests, 1);
+    assert.equal(stats.json.providers.openai.inputTokens, 42);
+    assert.equal(stats.json.providers.openai.outputTokens, 17);
+    const a = stats.json.agents['worktree-codex'];
+    assert.ok(a && a.providers.openai === 1);
+    assert.equal(a.inputTokens, 42);
+  } finally {
+    delete process.env.OPENAI_UPSTREAM;
+    await new Promise((r) => fake.close(r));
+  }
+});
+
+test('passthrough: upstream caído -> 502 upstream_error, no 500 genérico', async () => {
+  process.env.OPENAI_UPSTREAM = 'http://127.0.0.1:9'; // puerto inválido
+  try {
+    const res = await request('POST', '/openai/v1/chat/completions', {
+      headers: { authorization: 'Bearer x' },
+      body: { model: 'gpt-x', messages: [] },
+    });
+    assert.equal(res.status, 502);
+    assert.equal(res.json.error, 'upstream_error');
+  } finally {
+    delete process.env.OPENAI_UPSTREAM;
+  }
+});
+
 test('petición sin system no revienta (regresión deepClone) y llega al SDK', async () => {
   const res = await request('POST', '/v1/messages', {
     headers: { 'x-api-key': 'k-nosystem' },

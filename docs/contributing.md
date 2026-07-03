@@ -148,7 +148,7 @@ test('técnica X: el proxy transforma el body antes de enviarlo', async () => {
 ## Ejecutar y verificar antes de abrir un PR
 
 ```bash
-npm test                    # los 51 tests deben pasar
+npm test                    # los 63 tests deben pasar
 node -e "require('./lib/optimizer'); require('./lib/dashboard'); console.log('carga OK')"
 ```
 

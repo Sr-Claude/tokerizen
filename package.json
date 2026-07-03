@@ -1,6 +1,6 @@
 {
   "name": "claude-token-optimizer",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "Proxy inteligente para la API de Anthropic (Fable 5, Haiku, Sonnet, Opus) que reduce el consumo de tokens: caché de prefijos, compresión de historial, batching y max_tokens dinámico. Compatible con streaming.",
   "main": "server.js",
   "type": "commonjs",
