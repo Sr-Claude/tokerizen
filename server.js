@@ -40,8 +40,31 @@ const {
 
 const app = express();
 app.set('trust proxy', 1); // 1 salto (nginx/PM2/Docker) para que req.ip sea correcto
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+
+// CORS pensado para despliegue LOCAL. Los clientes legítimos (Claude Code, Cline,
+// curl, SDKs, servidor→servidor) NO envían cabecera Origin y se permiten siempre.
+// Una petición CON Origin viene de un navegador: solo se aceptan orígenes locales
+// (el propio dashboard) o los del allowlist CORS_ALLOWED. Esto impide que una web
+// cualquiera abierta en tu navegador haga fetch a http://localhost:8080 y consuma
+// tu ANTHROPIC_API_KEY por defecto. El POST /v1/messages usa JSON, que dispara
+// preflight, así que un origen no permitido nunca llega a gastar la key.
+const corsAllowed = (process.env.CORS_ALLOWED || '').split(',').map(s => s.trim()).filter(Boolean);
+function isLocalOrigin(origin) {
+  try {
+    const host = new URL(origin).hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  } catch (_) {
+    return false;
+  }
+}
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);                 // cliente no-navegador (CLI/SDK)
+    if (isLocalOrigin(origin) || corsAllowed.includes(origin)) return cb(null, true);
+    cb(null, false);                                     // navegador externo: sin ACAO → bloqueado
+  },
+}));
+app.use(express.json({ limit: process.env.JSON_LIMIT || '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Logging estructurado por petición (con request-id). No registra endpoints ruidosos.
@@ -70,6 +93,24 @@ function hashKey(value) {
   return crypto.createHash('sha256').update(value || '').digest('hex').slice(0, 16);
 }
 
+// Credencial normalizada del cliente (x-api-key o Bearer), para rate limit y fallback.
+function clientCredential(req) {
+  return req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || '';
+}
+
+// Fallback a las keys del SERVIDOR (ANTHROPIC/OPENAI/XAI_API_KEY del entorno):
+// si PROXY_SECRET está definido, solo se permite con la cabecera x-proxy-secret
+// correcta. Sin PROXY_SECRET (despliegue localhost puro) se mantiene el
+// comportamiento abierto. Comparación en tiempo constante.
+function serverKeyAllowed(req) {
+  const secret = process.env.PROXY_SECRET;
+  if (!secret) return true;
+  const given = String(req.headers['x-proxy-secret'] || '');
+  const a = crypto.createHash('sha256').update(given).digest();
+  const b = crypto.createHash('sha256').update(secret).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 // Rate limiting por API key (respaldo: IP). Solo en las rutas que llaman a Anthropic.
 const apiLimiter = rateLimit({
   windowMs: CONFIG.RATE_LIMIT_WINDOW_MS,
@@ -77,7 +118,9 @@ const apiLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   keyGenerator: (req) => {
-    const cred = req.headers['x-api-key'] || req.headers['authorization'];
+    // Credencial normalizada: el mismo cliente usando x-api-key o Authorization
+    // cae en el MISMO cubo de límite (antes obtenía dos cubos distintos).
+    const cred = clientCredential(req);
     return cred ? hashKey(cred) : ipKeyGenerator(req.ip);
   },
   handler: (req, res) => {
@@ -138,6 +181,7 @@ let metrics = {
 };
 
 function loadCacheFromDisk() {
+  if (!CONFIG.CACHE_FILE) return; // CACHE_FILE='' desactiva la persistencia a disco
   try {
     if (fs.existsSync(CONFIG.CACHE_FILE)) {
       const data = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, 'utf-8'));
@@ -156,6 +200,7 @@ function loadCacheFromDisk() {
 }
 
 function saveCacheToDisk() {
+  if (!CONFIG.CACHE_FILE) return; // CACHE_FILE='' desactiva la persistencia a disco
   try {
     fs.writeFileSync(CONFIG.CACHE_FILE, JSON.stringify({
       conversationCache: Object.fromEntries(conversationCache),
@@ -319,7 +364,11 @@ async function processBatch(tasks, system, apiKey, options = {}) {
   const sysTokens = estimateTokens(typeof system === 'string' ? system : JSON.stringify(system || ''));
   addSavedTokens(sysTokens * Math.max(0, tasks.length - 1), model);
 
-  return parsed.length ? parsed.map(c => ({ content: c })) : [{ content: text, warning: 'Batch parsing failed' }];
+  const anyParsed = parsed.some(c => c !== undefined);
+  if (!anyParsed) return [{ content: text, warning: 'Batch parsing failed' }];
+  // Alineado por índice de tarea: una tarea omitida por el modelo devuelve error,
+  // nunca la respuesta de la tarea siguiente.
+  return tasks.map((_, i) => (parsed[i] !== undefined ? { content: parsed[i] } : { content: '', error: 'No result' }));
 }
 
 // Cola de batch agrupada por (system, model, apiKey) para no mezclar peticiones distintas.
@@ -358,7 +407,11 @@ app.post('/v1/messages', async (req, res) => {
   const originalBody = req.body || {};
   metrics.totalRequests++;
 
-  const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || process.env.ANTHROPIC_API_KEY;
+  const clientKey = clientCredential(req);
+  if (!clientKey && !serverKeyAllowed(req)) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Se requiere x-api-key/Authorization o x-proxy-secret válido.' });
+  }
+  const apiKey = clientKey || process.env.ANTHROPIC_API_KEY;
   const clientMaxTokens = originalBody.max_tokens;
   const clientStream = !!originalBody.stream;
   const optInAntiPreamble = req.headers['x-anti-preamble'] === 'true';
@@ -392,8 +445,9 @@ app.post('/v1/messages', async (req, res) => {
     const respCacheKey = (wantsResponseCache && !clientStream) ? responseCacheKey(keyScope, originalBody) : null;
     if (respCacheKey) {
       const hit = responseCache.get(respCacheKey);
+      // TTL ABSOLUTO desde la creación (no se refresca en cada hit): una respuesta
+      // muy consultada también expira, evitando servir contenido obsoleto para siempre.
       if (hit && Date.now() - hit.timestamp <= CONFIG.RESPONSE_CACHE_TTL_MS) {
-        hit.timestamp = Date.now(); // refresca TTL: sigue en uso
         metrics.totalResponseCacheHits++;
         // Se ahorró la llamada completa: entrada + salida al precio real del modelo.
         const savedTok = (hit.usage?.input_tokens || 0) + (hit.usage?.cache_read_input_tokens || 0) + (hit.usage?.output_tokens || 0);
@@ -555,14 +609,36 @@ app.post('/v1/messages', async (req, res) => {
         if (Array.isArray(cleanBody.tools)) cleanBody.tools.forEach(t => delete t.cache_control);
 
         const client = makeClient(apiKey);
+        const retryModel = cleanBody.model || CONFIG.DEFAULT_MODEL;
         if (cleanBody.stream) {
           delete cleanBody.stream;
           const stream = client.messages.stream(cleanBody, { signal: controller.signal });
           res.setHeader('Content-Type', 'text/event-stream');
-          for await (const event of stream) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-          return res.end();
+          const retryUsage = {};
+          for await (const event of stream) {
+            if (event.type === 'message_start' && event.message?.usage) Object.assign(retryUsage, event.message.usage);
+            if (event.type === 'message_delta' && event.usage) Object.assign(retryUsage, event.usage);
+            res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+          }
+          res.end();
+          // El reintento también gasta: se contabiliza igual que el camino normal.
+          addSavedTokens(tokensSavedFromUsage(retryUsage), retryModel);
+          recordAgentUsage(agentId, {
+            costUSD: estimateCostUSD(retryUsage, retryModel),
+            savedTokens: tokensSavedFromUsage(retryUsage),
+            inputTokens: retryUsage.input_tokens || 0,
+            outputTokens: retryUsage.output_tokens || 0,
+          });
+          return;
         }
         const response = await client.messages.create(cleanBody, { signal: controller.signal });
+        addSavedTokens(tokensSavedFromUsage(response.usage), retryModel);
+        recordAgentUsage(agentId, {
+          costUSD: estimateCostUSD(response.usage, retryModel),
+          savedTokens: tokensSavedFromUsage(response.usage),
+          inputTokens: response.usage?.input_tokens || 0,
+          outputTokens: response.usage?.output_tokens || 0,
+        });
         return res.json(response);
       } catch (retryError) {
         req.log.error({ err: retryError }, 'falló el reintento sin cache_control');
@@ -582,7 +658,11 @@ app.post('/v1/batch', async (req, res) => {
     if (!Array.isArray(tasks) || tasks.length === 0) return res.status(400).json({ error: 'Array "tasks" requerido.' });
     if (tasks.length > CONFIG.BATCH_MAX_TASKS) return res.status(400).json({ error: `Máximo ${CONFIG.BATCH_MAX_TASKS} tareas. Recibido: ${tasks.length}.` });
 
-    const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || process.env.ANTHROPIC_API_KEY;
+    const clientKey = clientCredential(req);
+    if (!clientKey && !serverKeyAllowed(req)) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Se requiere x-api-key/Authorization o x-proxy-secret válido.' });
+    }
+    const apiKey = clientKey || process.env.ANTHROPIC_API_KEY;
     const controller = new AbortController();
     res.once('close', () => { if (!res.writableEnded) controller.abort(); });
 
@@ -615,7 +695,11 @@ app.post('/v1/batch/auto', async (req, res) => {
     const { prompt, system, model } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'Se requiere "prompt".' });
 
-    const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '') || process.env.ANTHROPIC_API_KEY;
+    const clientKey = clientCredential(req);
+    if (!clientKey && !serverKeyAllowed(req)) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Se requiere x-api-key/Authorization o x-proxy-secret válido.' });
+    }
+    const apiKey = clientKey || process.env.ANTHROPIC_API_KEY;
     const sysKey = crypto.createHash('sha256').update(system || '').digest('hex').slice(0, 12);
     const modelKey = (model || 'default').replace(/[^a-z0-9]/gi, '');
     const keyKey = hashKey(apiKey);
@@ -684,7 +768,17 @@ function providerHandler(name) {
     res.once('close', onClose);
 
     const headers = { 'content-type': 'application/json' };
-    const auth = req.headers['authorization'] || (process.env[p.envKey] ? `Bearer ${process.env[p.envKey]}` : undefined);
+    // La key del servidor solo se inyecta si el fallback está autorizado
+    // (PROXY_SECRET sin definir, o x-proxy-secret correcto).
+    let auth = req.headers['authorization'];
+    if (!auth && process.env[p.envKey]) {
+      if (!serverKeyAllowed(req)) {
+        res.status(401).json({ error: 'unauthorized', message: 'Se requiere Authorization o x-proxy-secret válido.' });
+        res.removeListener('close', onClose);
+        return;
+      }
+      auth = `Bearer ${process.env[p.envKey]}`;
+    }
     if (auth) headers.authorization = auth;
 
     try {
@@ -788,6 +882,9 @@ fs.writeFileSync(path.join(__dirname, 'public', 'dashboard.html'), dashboardHTML
 
 // ==================== ARRANQUE Y APAGADO ORDENADO ====================
 const PORT = process.env.PORT || 8080;
+// Por defecto solo escucha en loopback: /stats, /dashboard y el fallback a las
+// keys del servidor no quedan expuestos a la red local. HOST=0.0.0.0 para abrirlo.
+const HOST = process.env.HOST || '127.0.0.1';
 let httpServer;
 
 async function shutdown(signal) {
@@ -812,7 +909,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 // Solo arrancamos el servidor si el archivo se ejecuta directamente (no al importarlo en tests).
 if (require.main === module) {
   loadCacheFromDisk();
-  httpServer = app.listen(PORT, () => {
+  httpServer = app.listen(PORT, HOST, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║   🦊 Claude Token Optimizer v3.4 (Producción)        ║

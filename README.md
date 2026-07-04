@@ -75,9 +75,13 @@ El proxy estará escuchando en `http://localhost:8080`.
 |----------|-------------|:-----------------:|
 | `ANTHROPIC_API_KEY` | API key de Anthropic (respaldo si el cliente no envía la suya) | Requerida* |
 | `PORT` | Puerto del servidor | `8080` |
+| `HOST` | Interfaz de escucha (`0.0.0.0` para exponerlo en red) | `127.0.0.1` |
+| `PROXY_SECRET` | Si se define, el uso de las keys del servidor como respaldo exige la cabecera `x-proxy-secret` con este valor; sin ella → `401` | — (respaldo abierto) |
+| `JSON_LIMIT` | Tamaño máximo del body JSON aceptado | `50mb` |
+| `CORS_ALLOWED` | Orígenes de navegador extra permitidos (separados por comas); los locales siempre se aceptan | — |
 | `DEFAULT_MODEL` | Modelo usado si el cliente no envía `model` | `claude-opus-4-8` |
 | `COMPRESSION_MODEL` | Modelo para comprimir historial | `claude-haiku-4-5` |
-| `CACHE_FILE` | Ruta del archivo de persistencia | `./cache.json` |
+| `CACHE_FILE` | Ruta del archivo de persistencia (`''` la desactiva) | `./cache.json` |
 | `REQUEST_TIMEOUT_MS` | Timeout de las llamadas a Anthropic | `120000` |
 | `MAX_RETRIES` | Reintentos del SDK ante fallos transitorios | `2` |
 | `RATE_LIMIT_WINDOW_MS` | Ventana del rate limiter | `60000` |
@@ -243,7 +247,7 @@ export OPENAI_BASE_URL="http://localhost:8080/openai/v1"
 export XAI_BASE_URL="http://localhost:8080/xai/v1"
 ```
 
-- La cabecera `Authorization` del cliente se reenvía; si no la envía, se usa `OPENAI_API_KEY`/`XAI_API_KEY` del servidor como respaldo.
+- La cabecera `Authorization` del cliente se reenvía; si no la envía, se usa `OPENAI_API_KEY`/`XAI_API_KEY` del servidor como respaldo. Si `PROXY_SECRET` está definido, ese respaldo exige la cabecera `x-proxy-secret` correcta (si no → `401`).
 - Soporta streaming (SSE) con passthrough binario; el `usage` se captura del último chunk cuando el cliente pide `stream_options: {include_usage: true}`.
 - Se miden **tokens, no USD** (no mantenemos tabla de precios de terceros).
 - `x-agent-id` y `x-budget-usd` también funcionan aquí (el presupuesto limita el gasto **Claude** acumulado de esa etiqueta).
@@ -328,15 +332,15 @@ Medidas activas en el proxy:
 
 - **Aislamiento de caché por API key.** La caché de compresión se indexa como `hash(api_key):conversation_id`. Sin esto, un cliente podría inyectar el `x-conversation-id` de otro usuario y recibir el **resumen de una conversación ajena** dentro de su propia petición. El header `x-conversation-id` que devuelve el proxy ya viene con el prefijo, así que puedes reenviarlo tal cual.
 - **API keys nunca en claro fuera del cliente HTTP.** El rate limiter, las claves de la caché y las colas de batch usan un hash SHA-256 truncado de la key, no la key. Los logs redactan `x-api-key` y `Authorization` siempre.
-- **Validación de entrada.** `messages` debe ser un array (400 si no lo es); `tasks` en batch está acotado a `BATCH_MAX_TASKS`; el body JSON está limitado a 50 MB.
+- **Validación de entrada.** `messages` debe ser un array (400 si no lo es); `tasks` en batch está acotado a `BATCH_MAX_TASKS`; el body JSON está limitado a 50 MB (configurable con `JSON_LIMIT`).
 - **Rate limiting por API key** (respaldo por IP) en todas las rutas `/v1/*`.
 - **Abort upstream.** Si el cliente corta la conexión, la llamada a Anthropic se aborta: nadie puede agotar recursos manteniendo peticiones huérfanas.
 
 Cosas que debes tener en cuenta al desplegar:
 
-- **No expongas el proxy a Internet sin autenticación.** `/stats`, `/health` y `/dashboard` no requieren credenciales y muestran métricas de uso; y `/v1/*` reenvía a Anthropic usando `ANTHROPIC_API_KEY` como respaldo si el cliente no envía key propia. Ejecútalo en localhost, en una red privada, o detrás de un reverse proxy con autenticación.
-- **`cache.json` contiene resúmenes de conversaciones en claro.** Protege el archivo con permisos adecuados y exclúyelo de backups compartidos (ya está en `.gitignore`). Puedes moverlo con `CACHE_FILE`.
-- **CORS está abierto (`*`)** para que funcione con cualquier cliente local. Si lo despliegas en un dominio público, restringe el origen en `server.js` (`cors({ origin: ... })`).
+- **Por defecto solo escucha en `127.0.0.1`.** Para exponerlo en red usa `HOST=0.0.0.0` — y en ese caso define `PROXY_SECRET`: sin él, cualquier petición sin key propia consumiría `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`XAI_API_KEY` del servidor. `/stats`, `/health` y `/dashboard` no requieren credenciales y muestran métricas de uso; si el proxy sale de localhost, ponlos detrás de un reverse proxy con autenticación.
+- **`cache.json` contiene resúmenes de conversaciones en claro.** Protege el archivo con permisos adecuados y exclúyelo de backups compartidos (ya está en `.gitignore`). Puedes moverlo con `CACHE_FILE` o desactivar la persistencia con `CACHE_FILE=''`.
+- **CORS restringido a orígenes locales.** Las peticiones sin `Origin` (CLIs, SDKs, servidor→servidor) se permiten siempre; desde navegador solo se aceptan `localhost`/`127.0.0.1` y los orígenes del allowlist `CORS_ALLOWED` (lista separada por comas).
 
 ---
 

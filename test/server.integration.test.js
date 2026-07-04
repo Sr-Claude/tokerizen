@@ -394,6 +394,58 @@ test('presupuesto: x-budget-usd sin x-agent-id -> 400', async () => {
   assert.equal(res.json.error, 'missing_agent_id');
 });
 
+test('CORS preflight: allowed local origin returns ACAO header; disallowed origin blocked', async () => {
+  // Preflight from allowed local origin
+  const allowedOrigin = 'http://localhost:3000';
+  const preflightAllowed = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'OPTIONS', path: '/v1/messages', headers: {
+      Origin: allowedOrigin,
+      'Access-Control-Request-Method': 'POST',
+    } }, (res) => {
+      let chunks = '';
+      res.on('data', (d) => { chunks += d; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: chunks }));
+    });
+    req.on('error', reject); req.end();
+  });
+  // Allowed origin should receive Access-Control-Allow-Origin header matching the origin
+  assert.ok(preflightAllowed.headers['access-control-allow-origin']);
+  assert.equal(preflightAllowed.headers['access-control-allow-origin'], allowedOrigin);
+
+  // Preflight from disallowed origin
+  const badOrigin = 'https://evil.example';
+  const preflightBlocked = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'OPTIONS', path: '/v1/messages', headers: {
+      Origin: badOrigin,
+      'Access-Control-Request-Method': 'POST',
+    } }, (res) => {
+      let chunks = '';
+      res.on('data', (d) => { chunks += d; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: chunks }));
+    });
+    req.on('error', reject); req.end();
+  });
+  // Disallowed origin should NOT receive ACAO header (browser would block preflight)
+  assert.equal(preflightBlocked.headers['access-control-allow-origin'], undefined);
+});
+
+test('PROXY_SECRET: requests without x-proxy-secret are rejected; correct secret allowed', async () => {
+  const prev = process.env.PROXY_SECRET;
+  process.env.PROXY_SECRET = 'test-secret-123';
+
+  try {
+    // Request without x-proxy-secret and without x-api-key -> 401
+    const r1 = await request('POST', '/v1/batch', { body: { tasks: [{ prompt: 'hola' }] } });
+    assert.equal(r1.status, 401);
+
+    // Request with correct x-proxy-secret -> allowed (200)
+    const r2 = await request('POST', '/v1/batch', { headers: { 'x-proxy-secret': 'test-secret-123' }, body: { tasks: [{ prompt: 'hola' }] } });
+    assert.equal(r2.status, 200);
+  } finally {
+    if (prev === undefined) delete process.env.PROXY_SECRET; else process.env.PROXY_SECRET = prev;
+  }
+});
+
 test('caché de respuestas: 2ª petición idéntica es hit y no llama al SDK', async () => {
   state.createImpl = async () => ({
     id: 'msg_rc', type: 'message', role: 'assistant',

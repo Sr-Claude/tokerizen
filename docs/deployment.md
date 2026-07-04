@@ -9,9 +9,9 @@ Guía para desplegar el Token Optimizer con PM2, Docker o Kubernetes. Para la co
 - [ ] **Node.js ≥ 20** en el entorno de ejecución.
 - [ ] `NODE_ENV=production` → logs en JSON (aptos para agregadores).
 - [ ] Decide el modelo de **API key**: ¿cada cliente envía la suya (recomendado) o usas `ANTHROPIC_API_KEY` del servidor como respaldo?
-- [ ] **No expongas el proxy a Internet sin autenticación.** `/stats`, `/health` y `/dashboard` no piden credenciales y muestran métricas de uso; `/v1/*` puede reenviar con la key del servidor. Ponlo en localhost, red privada, o detrás de un reverse proxy con auth.
-- [ ] Protege `cache.json`: contiene **resúmenes de conversaciones en claro**. Permisos restrictivos y fuera de backups compartidos.
-- [ ] Si sirves un dominio público, restringe **CORS** (por defecto está abierto: `*`).
+- [ ] **Por defecto escucha solo en `127.0.0.1`.** Para exponerlo en red pon `HOST=0.0.0.0` **y define `PROXY_SECRET`**: sin él, cualquier petición sin key propia puede consumir las keys del servidor. `/stats`, `/health` y `/dashboard` no piden credenciales y muestran métricas de uso; detrás de un reverse proxy, añade auth para esas rutas.
+- [ ] Protege `cache.json`: contiene **resúmenes de conversaciones en claro**. Permisos restrictivos y fuera de backups compartidos, o desactívalo con `CACHE_FILE=''`.
+- [ ] **CORS** ya viene restringido a orígenes locales; añade los tuyos con `CORS_ALLOWED` (lista separada por comas) si un dashboard externo debe llamar al proxy desde navegador.
 - [ ] Un solo proceso mantiene todo el estado en memoria. Si vas a escalar a varias réplicas, lee primero [Escalado horizontal](#escalado-horizontal-y-estado-compartido).
 
 ---
@@ -22,6 +22,8 @@ Guía para desplegar el Token Optimizer con PM2, Docker o Kubernetes. Para la co
 |----------|-----------------------|
 | `NODE_ENV` | `production` (logs JSON) |
 | `PORT` | El que exponga tu orquestador (por defecto `8080`) |
+| `HOST` | `0.0.0.0` en contenedores/K8s (dentro de la red del pod); por defecto `127.0.0.1` |
+| `PROXY_SECRET` | **Defínelo siempre que el proxy salga de localhost** — exige `x-proxy-secret` para usar las keys del servidor |
 | `ANTHROPIC_API_KEY` | Solo si quieres key de respaldo del servidor; si no, que cada cliente envíe la suya |
 | `DEFAULT_MODEL` | Modelo por defecto si el cliente no envía uno (`claude-opus-4-8`) |
 | `COMPRESSION_MODEL` | Modelo de compresión (`claude-haiku-4-5`) |
@@ -116,6 +118,7 @@ USER node
 
 ENV NODE_ENV=production \
     PORT=8080 \
+    HOST=0.0.0.0 \
     CACHE_FILE=/data/cache.json
 
 EXPOSE 8080
@@ -171,6 +174,7 @@ services:
       - "8080:8080"
     environment:
       NODE_ENV: production
+      HOST: 0.0.0.0   # dentro del contenedor debe escuchar en todas las interfaces
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       CACHE_FILE: /data/cache.json
       LOG_LEVEL: info
@@ -209,6 +213,7 @@ metadata:
 type: Opaque
 stringData:
   ANTHROPIC_API_KEY: "sk-ant-..."      # opcional: solo si usas key de respaldo del servidor
+  PROXY_SECRET: "cambia-esto"          # exige x-proxy-secret para usar las keys del servidor
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -217,6 +222,7 @@ metadata:
 data:
   NODE_ENV: "production"
   PORT: "8080"
+  HOST: "0.0.0.0"                      # dentro del pod debe escuchar en todas las interfaces
   CACHE_FILE: "/data/cache.json"
   LOG_LEVEL: "info"
   DEFAULT_MODEL: "claude-opus-4-8"
