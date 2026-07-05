@@ -13,6 +13,9 @@ npm-debug.log*
 .env
 .env.*
 
+# Config local de Claude Code (puede contener API keys)
+.claude/settings.local.json
+
 # Sistema
 .DS_Store
 Thumbs.db

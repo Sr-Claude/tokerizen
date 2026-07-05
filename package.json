@@ -6,7 +6,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
+    "start:oauth": "node server-oauth.js",
     "dev": "node --watch server.js",
+    "dev:oauth": "node --watch server-oauth.js",
     "test": "node --test"
   },
   "engines": {

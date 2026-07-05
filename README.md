@@ -4,6 +4,10 @@
 
 Reduce el consumo de tokens aplicando varias técnicas de optimización de forma transparente, sin modificar tu código cliente. **Soporta streaming (SSE)**, por lo que funciona con Claude Code y Cline, y **reenvía la API key del cliente**.
 
+Incluye dos variantes según cómo te autentiques:
+- **`server.js`** — cliente con **API key** (`x-api-key`): el cuello de botella es el gasto en `$`, así que optimiza caché de prefijos, compresión y batching.
+- **`server-oauth.js`** — cliente con **suscripción** (`Authorization: Bearer` de OAuth): el cuello de botella son los **rate limits**, así que optimiza el tamaño de cada petición (recorte de `tool_results` + auto-compact). Ver [Variante OAuth](#-variante-oauth-suscripción--server-oauthjs).
+
 > **Nota:** por defecto el servidor solo escucha en `127.0.0.1`, CORS solo acepta orígenes locales y los endpoints de métricas no llevan autenticación — es lo correcto para uso local con Claude Code/Cline. Si vas a exponerlo en red (`HOST=0.0.0.0`), define `PROXY_SECRET` y pon los endpoints de métricas detrás de un reverse proxy con auth.
 
 ---
@@ -315,6 +319,36 @@ Panel de control web con métricas en tiempo real. Abre `http://localhost:8080/d
 
 ---
 
+## 🔑 Variante OAuth (suscripción) — `server-oauth.js`
+
+Gemelo de `server.js` pensado para cuando el cliente (p. ej. Claude Code en VS Code) está autenticado con tu **suscripción** de Claude, no con una API key. En ese caso el cliente manda `Authorization: Bearer <token OAuth>` + la cabecera `anthropic-beta` con el flag de OAuth. Este servidor **reenvía ese Bearer tal cual** hacia Anthropic (nunca lo convierte en `x-api-key`) y conserva `anthropic-beta`.
+
+En suscripción el límite no es el gasto por token sino los **rate limits**, así que el valor añadido aquí no es ahorro de `$` sino **gestión de contexto** (`lib/context.js`): recorte de `tool_results` antiguos + auto-compact local, ambos aplicados sin llamadas extra a la API (una llamada de resumen consumiría el mismo límite que se quiere proteger).
+
+```bash
+npm run start:oauth   # arranca en el puerto 8082 (o dev:oauth para --watch)
+```
+
+| Variable | Por defecto | Descripción |
+|----------|:-----------:|-------------|
+| `PORT_OAUTH` | `8082` | Puerto (distinto al de `server.js` para poder correr ambos a la vez) |
+| `CONTEXT_MODE` | `normal` | `aggressive` aprieta a la vez todos los umbrales de abajo (recorta más, antes, y compacta con umbral más bajo). Cualquier variable individual fijada explícitamente sigue ganando sobre este preset. |
+| `TRIM_TOOL_RESULTS` | `true` | Recorta el texto de `tool_results` fuera de los últimos N turnos |
+| `TRIM_KEEP_TURNS` | `3` (`1` en aggressive) | Turnos recientes que se dejan intactos al recortar |
+| `TRIM_MAX_CHARS` | `2000` (`500` en aggressive) | Tamaño a partir del cual se recorta un `tool_result` viejo |
+| `TRIM_HEAD_CHARS` / `TRIM_TAIL_CHARS` | `1200` / `600` (`300` / `150` en aggressive) | Cabeza + cola que se conservan de un `tool_result` viejo recortado |
+| `TRIM_MAX_CHARS_RECENT` | `20000` (`6000` en aggressive) | Capa 2: límite suave para `tool_results` gigantes incluso en turnos recientes (`0` = desactivado) |
+| `TRIM_HEAD_CHARS_RECENT` / `TRIM_TAIL_CHARS_RECENT` | `12000` / `6000` (`4000` / `2000` en aggressive) | Cabeza + cola que se conservan de un `tool_result` reciente recortado |
+| `AUTO_COMPACT` | `true` | Pliega turnos antiguos en un resumen cuando la conversación supera el umbral |
+| `COMPACT_THRESHOLD_TOKENS` | `120000` (`50000` en aggressive) | Umbral estimado (heurística `length/3.5`) a partir del cual se compacta |
+| `COMPACT_KEEP_TURNS` | `8` (`3` en aggressive) | Turnos recientes que se conservan sin compactar |
+
+Cabecera `x-skip-context: true` para desactivar la gestión de contexto en una petición puntual.
+
+Expone los mismos `POST /v1/messages` (streaming y no-stream), `GET /stats`, `GET /health` y también `GET /dashboard` — con un panel propio (`lib/dashboard-oauth.js`) centrado en tokens por petición, compactaciones, recortes y el estado del rate limit local, en vez de gasto en `$`.
+
+---
+
 ## 🦊 Compatibilidad con modelos
 
 El proxy detecta automáticamente el modelo usado a partir de su nombre y **sanea la petición** para que nunca llegue a Anthropic con parámetros que ese modelo rechazaría con `400`:
@@ -413,21 +447,26 @@ Verifica que la carpeta `public/` se haya creado automáticamente en el director
 
 ```
 .
-├── server.js               # HTTP: endpoints, middleware, streaming, apagado ordenado
+├── server.js               # Variante API key: endpoints, middleware, streaming, apagado ordenado
+├── server-oauth.js         # Variante OAuth (suscripción): reenvía el Bearer, gestión de contexto/rate limit
 ├── lib/
-│   ├── optimizer.js        # Lógica pura de optimización (testeable)
-│   ├── dashboard.js        # HTML del dashboard (autocontenido, sin CDNs)
+│   ├── optimizer.js        # Lógica pura de optimización (testeable) — usada por ambas variantes
+│   ├── context.js          # Gestión de contexto de la variante OAuth: trim de tool_results + auto-compact
+│   ├── dashboard.js         # HTML del dashboard de server.js (autocontenido, sin CDNs)
+│   ├── dashboard-oauth.js  # HTML del dashboard de server-oauth.js (tokens/contexto/rate limit)
 │   └── logger.js           # Logger pino configurado
 ├── test/
 │   ├── optimizer.test.js            # Tests unitarios de la lógica pura
+│   ├── context.test.js              # Tests de la gestión de contexto (trim/compact) de server-oauth.js
 │   └── server.integration.test.js   # Tests de integración HTTP (SDK mockeado, sin red)
 ├── docs/
 │   ├── architecture.md     # Las 7 técnicas y el flujo interno
 │   ├── deployment.md       # PM2, Docker, Kubernetes
 │   └── contributing.md     # Cómo añadir técnicas + convenciones
 ├── public/
-│   └── dashboard.html      # Panel de control (auto-generado)
-├── cache.json              # Persistencia de caché + métricas (auto-generado)
+│   ├── dashboard.html       # Panel de control de server.js (auto-generado)
+│   └── dashboard-oauth.html # Panel de control de server-oauth.js (auto-generado)
+├── cache.json              # Persistencia de caché + métricas de server.js (auto-generado)
 ├── package.json
 ├── .gitignore
 └── README.md
@@ -481,7 +520,8 @@ Basado en pruebas internas con conversaciones de desarrollo típicas (50–100 t
 - **Conteo real de tokens (`POST /v1/messages/count_tokens`):** passthrough al endpoint gratuito de Anthropic para medir el tamaño real de un prompt (reemplaza la heurística `length/3.5` cuando se necesita precisión antes de decidir comprimir o batchear).
 - **Endurecimiento tras auditoría interna:** `PROXY_SECRET` + `x-proxy-secret` para proteger el fallback a las keys del servidor, bind a `127.0.0.1` por defecto (`HOST`), CORS restringido a orígenes locales + `CORS_ALLOWED`, alineación por índice en `/v1/batch` (una tarea omitida ya no desplaza las respuestas de las siguientes), TTL absoluto en la caché de respuestas, `CACHE_FILE=''` para desactivar la persistencia y `JSON_LIMIT` configurable.
 - Nuevas variables: `RESPONSE_CACHE_TTL_MS`, `RESPONSE_CACHE_MAX`, `OPENAI_UPSTREAM`, `XAI_UPSTREAM`, `OPENAI_API_KEY`, `XAI_API_KEY`, `HOST`, `PROXY_SECRET`, `JSON_LIMIT`, `CORS_ALLOWED`, `BUDGET_ALERT_WEBHOOK_URL`, `BUDGET_ALERT_THRESHOLD_PCT`.
-- 16 tests nuevos (67 en total): atribución, presupuestos, aviso de presupuesto por webhook, caché de respuestas (hit/aislamiento por key), passthrough con upstream mockeado, manejo de upstream caído, CORS, `PROXY_SECRET` y `count_tokens`.
+- 16 tests nuevos: atribución, presupuestos, aviso de presupuesto por webhook, caché de respuestas (hit/aislamiento por key), passthrough con upstream mockeado, manejo de upstream caído, CORS, `PROXY_SECRET` y `count_tokens`.
+- **Variante OAuth (`server-oauth.js`):** gemelo para clientes autenticados por suscripción (`Authorization: Bearer`, reenviado sin convertir a `x-api-key`). Añade gestión de contexto local (`lib/context.js`: recorte de `tool_results` + auto-compact) y su propio dashboard (`lib/dashboard-oauth.js`) centrado en tokens, compactaciones y estado del rate limit — ver [Variante OAuth](#-variante-oauth-suscripción--server-oauthjs). 10 tests nuevos en `test/context.test.js` (77 en total).
 
 ### v3.3.0 (2026-07-02)
 
