@@ -16,6 +16,7 @@ const state = {
   calls: [],
   createImpl: null,
   streamImpl: null,
+  countTokensImpl: null,
 };
 
 class FakeAnthropic {
@@ -29,6 +30,10 @@ class FakeAnthropic {
       stream: (body, options) => {
         state.calls.push({ body, options, stream: true });
         return state.streamImpl(body, options);
+      },
+      countTokens: async (body, options) => {
+        state.calls.push({ body, options, countTokens: true });
+        return state.countTokensImpl(body, options);
       },
     };
   }
@@ -78,6 +83,7 @@ beforeEach(() => {
     yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hola' } };
     yield { type: 'message_stop' };
   })();
+  state.countTokensImpl = async () => ({ input_tokens: 123 });
 });
 
 function request(method, pathname, { headers = {}, body, raw = false } = {}) {
@@ -210,6 +216,17 @@ test('/v1/batch: parsea la respuesta delimitada y devuelve savings', async () =>
   assert.deepEqual(res.json.results, [{ content: 'París.' }, { content: '4.' }]);
   assert.equal(res.json.savings.tasks_count, 2);
   assert.ok(res.json.savings.savings_ratio >= 0);
+});
+
+test('/v1/messages/count_tokens: passthrough al conteo real de la API', async () => {
+  state.countTokensImpl = async (body) => ({ input_tokens: body.messages.length * 10 });
+  const res = await request('POST', '/v1/messages/count_tokens', {
+    headers: { 'x-api-key': 'k-count' },
+    body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hola' }, { role: 'assistant', content: 'hola' }] },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.input_tokens, 20);
+  assert.equal(lastCall().countTokens, true);
 });
 
 test('reintento sin cache_control ante un 400 de caché', async () => {
@@ -392,6 +409,48 @@ test('presupuesto: x-budget-usd sin x-agent-id -> 400', async () => {
   });
   assert.equal(res.status, 400);
   assert.equal(res.json.error, 'missing_agent_id');
+});
+
+test('presupuesto: webhook de aviso se dispara una vez al cruzar el 80%, no antes ni después', async () => {
+  const received = [];
+  const hook = http.createServer((q, s) => {
+    let data = '';
+    q.on('data', (d) => { data += d; });
+    q.on('end', () => { received.push(JSON.parse(data)); s.end('ok'); });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  const webhookUrl = `http://127.0.0.1:${hook.address().port}`;
+
+  state.createImpl = async () => ({
+    id: 'msg_w', type: 'message', role: 'assistant',
+    content: [{ type: 'text', text: 'ok' }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 1_000_000, output_tokens: 0 }, // Sonnet: $3 por petición
+  });
+  const body = { model: 'claude-sonnet-4-6', max_tokens: 100, messages: [{ role: 'user', content: 'analiza este informe en detalle' }] };
+  const headers = { 'x-api-key': 'k-webhook', 'x-agent-id': 'wt-webhook', 'x-budget-usd': '10', 'x-budget-webhook': webhookUrl };
+
+  try {
+    // 1ª petición: gasta $3 de $10 (30%) -> por debajo del umbral del 80%, sin aviso.
+    assert.equal((await request('POST', '/v1/messages', { headers, body })).status, 200);
+    // 2ª petición: gasta otros $3 -> acumulado $6/$10 (60%), sigue sin aviso.
+    assert.equal((await request('POST', '/v1/messages', { headers, body })).status, 200);
+    // 3ª petición: acumulado $9/$10 (90%) -> CRUZA el umbral del 80%, dispara el webhook.
+    assert.equal((await request('POST', '/v1/messages', { headers, body })).status, 200);
+    // Esperamos a que el fetch fire-and-forget llegue al servidor mock.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(received.length, 1, 'el webhook se dispara exactamente una vez al cruzar el umbral');
+    assert.equal(received[0].agent_id, 'wt-webhook');
+    assert.equal(received[0].budget_usd, 10);
+    assert.ok(received[0].spent_usd >= 8.9999);
+
+    // 4ª petición: el gasto YA estaba por encima del umbral antes de esta llamada -> no repite el aviso.
+    assert.equal((await request('POST', '/v1/messages', { headers, body })).status, 200);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(received.length, 1, 'no se repite el aviso en peticiones posteriores');
+  } finally {
+    await new Promise((r) => hook.close(r));
+  }
 });
 
 test('CORS preflight: allowed local origin returns ACAO header; disallowed origin blocked', async () => {

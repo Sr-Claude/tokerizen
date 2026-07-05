@@ -238,12 +238,14 @@ function normalizeAgentId(req) {
 }
 
 // Acumula uso por agente y el gasto global. `provider` distingue anthropic/openai/xai.
-function recordAgentUsage(agentId, { costUSD = 0, savedTokens = 0, inputTokens = 0, outputTokens = 0, provider = 'anthropic' } = {}) {
+// `req`, si se pasa, permite disparar el aviso temprano de presupuesto (ver checkBudgetAlert).
+function recordAgentUsage(agentId, { costUSD = 0, savedTokens = 0, inputTokens = 0, outputTokens = 0, provider = 'anthropic' } = {}, req = null) {
   metrics.totalSpentUSD += costUSD;
   if (!agentId) return;
   const s = agentStats.get(agentId) || {
     requests: 0, inputTokens: 0, outputTokens: 0, spentUSD: 0, savedTokens: 0, providers: {},
   };
+  const spentBefore = s.spentUSD;
   s.requests++;
   s.inputTokens += inputTokens;
   s.outputTokens += outputTokens;
@@ -252,6 +254,34 @@ function recordAgentUsage(agentId, { costUSD = 0, savedTokens = 0, inputTokens =
   s.providers[provider] = (s.providers[provider] || 0) + 1;
   s.lastSeen = Date.now();
   agentStats.set(agentId, s);
+  if (costUSD > 0) checkBudgetAlert(req, agentId, spentBefore, s.spentUSD);
+}
+
+// Aviso temprano (no bloqueante) cuando el gasto del agente CRUZA el umbral de
+// alerta (por defecto 80% de x-budget-usd, ver BUDGET_ALERT_THRESHOLD_PCT). Se
+// dispara UNA sola vez por cruce: exige que el gasto ANTERIOR estuviera por
+// debajo del umbral, así que peticiones posteriores no repiten el aviso.
+// webhook: cabecera x-budget-webhook (por petición) o BUDGET_ALERT_WEBHOOK_URL (global).
+function checkBudgetAlert(req, agentId, spentBefore, spentAfter) {
+  const rawBudget = req?.headers['x-budget-usd'];
+  const webhookUrl = req?.headers['x-budget-webhook'] || process.env.BUDGET_ALERT_WEBHOOK_URL;
+  if (!agentId || rawBudget === undefined || !webhookUrl) return;
+  const budget = parseFloat(rawBudget);
+  if (!Number.isFinite(budget) || budget <= 0) return;
+  const threshold = budget * CONFIG.BUDGET_ALERT_THRESHOLD_PCT;
+  if (spentBefore >= threshold || spentAfter < threshold) return;
+  const pct = Math.round((spentAfter / budget) * 100);
+  const payload = {
+    agent_id: agentId,
+    spent_usd: +spentAfter.toFixed(4),
+    budget_usd: budget,
+    threshold_pct: Math.round(CONFIG.BUDGET_ALERT_THRESHOLD_PCT * 100),
+    percent_used: pct,
+    message: `Agente "${agentId}" ha consumido el ${pct}% de su presupuesto ($${spentAfter.toFixed(4)} de $${budget}).`,
+  };
+  // Fire-and-forget: un webhook caído o lento no debe afectar la respuesta al cliente.
+  fetch(webhookUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+    .catch(err => logger.warn({ err, agentId }, 'fallo al notificar webhook de presupuesto'));
 }
 
 // Devuelve true (y responde 402) si el gasto acumulado del agente supera el
@@ -453,7 +483,7 @@ app.post('/v1/messages', async (req, res) => {
         const savedTok = (hit.usage?.input_tokens || 0) + (hit.usage?.cache_read_input_tokens || 0) + (hit.usage?.output_tokens || 0);
         metrics.totalTokensSaved += savedTok;
         metrics.totalSavingsUSD += hit.costUSD;
-        recordAgentUsage(agentId, { savedTokens: savedTok });
+        recordAgentUsage(agentId, { savedTokens: savedTok }, req);
         req.log.info({ agentId, savedTok }, 'hit de caché de respuestas');
         res.setHeader('x-response-cache', 'hit');
         return res.json(hit.response);
@@ -565,7 +595,7 @@ app.post('/v1/messages', async (req, res) => {
         savedTokens: tokensSavedFromUsage(streamUsage),
         inputTokens: streamUsage.input_tokens || 0,
         outputTokens: streamUsage.output_tokens || 0,
-      });
+      }, req);
     } else {
       const response = await client.messages.create(body, { signal: controller.signal });
       addSavedTokens(tokensSavedFromUsage(response.usage), model);
@@ -574,7 +604,7 @@ app.post('/v1/messages', async (req, res) => {
         savedTokens: tokensSavedFromUsage(response.usage),
         inputTokens: response.usage?.input_tokens || 0,
         outputTokens: response.usage?.output_tokens || 0,
-      });
+      }, req);
       // Guardar en la caché de respuestas solo terminaciones limpias de texto.
       if (respCacheKey && isResponseCacheable(response)) {
         if (responseCache.size >= CONFIG.RESPONSE_CACHE_MAX) {
@@ -628,7 +658,7 @@ app.post('/v1/messages', async (req, res) => {
             savedTokens: tokensSavedFromUsage(retryUsage),
             inputTokens: retryUsage.input_tokens || 0,
             outputTokens: retryUsage.output_tokens || 0,
-          });
+          }, req);
           return;
         }
         const response = await client.messages.create(cleanBody, { signal: controller.signal });
@@ -638,13 +668,41 @@ app.post('/v1/messages', async (req, res) => {
           savedTokens: tokensSavedFromUsage(response.usage),
           inputTokens: response.usage?.input_tokens || 0,
           outputTokens: response.usage?.output_tokens || 0,
-        });
+        }, req);
         return res.json(response);
       } catch (retryError) {
         req.log.error({ err: retryError }, 'falló el reintento sin cache_control');
       }
     }
 
+    res.status(error.status || 500).json({ error: true, message: error.error || error.message });
+  } finally {
+    res.removeListener('close', onClose);
+  }
+});
+
+// ==================== COUNT TOKENS (passthrough) ====================
+// Passthrough directo a /v1/messages/count_tokens: da el conteo REAL de tokens
+// de la API (Anthropic no cobra por este endpoint), a diferencia de la heurística
+// estimateTokens (length/3.5) que solo se usa internamente para métricas de ahorro.
+// Útil para que un cliente mida el tamaño real de un prompt antes de decidir
+// comprimirlo, podarlo o dividirlo en batch.
+app.post('/v1/messages/count_tokens', async (req, res) => {
+  const clientKey = clientCredential(req);
+  if (!clientKey && !serverKeyAllowed(req)) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Se requiere x-api-key/Authorization o x-proxy-secret válido.' });
+  }
+  const apiKey = clientKey || process.env.ANTHROPIC_API_KEY;
+  const controller = new AbortController();
+  const onClose = () => { if (!res.writableEnded) controller.abort(); };
+  res.once('close', onClose);
+  try {
+    const client = makeClient(apiKey);
+    const result = await client.messages.countTokens(req.body || {}, { signal: controller.signal });
+    res.json(result);
+  } catch (error) {
+    if (controller.signal.aborted) { try { res.end(); } catch (_) {} return; }
+    req.log?.error({ err: error, status: error.status }, 'error en /v1/messages/count_tokens');
     res.status(error.status || 500).json({ error: true, message: error.error || error.message });
   } finally {
     res.removeListener('close', onClose);
@@ -743,13 +801,14 @@ const PROVIDERS = {
   xai: { envBase: 'XAI_UPSTREAM', defaultBase: 'https://api.x.ai', envKey: 'XAI_API_KEY' },
 };
 
-function meterProvider(name, agentId, inputTokens, outputTokens) {
+function meterProvider(name, agentId, inputTokens, outputTokens, req) {
   const pm = metrics.providers[name] || (metrics.providers[name] = { requests: 0, inputTokens: 0, outputTokens: 0 });
   pm.requests++;
   pm.inputTokens += inputTokens;
   pm.outputTokens += outputTokens;
-  // Se registran tokens, no USD: no mantenemos tabla de precios de terceros.
-  recordAgentUsage(agentId, { inputTokens, outputTokens, provider: name });
+  // Se registran tokens, no USD: no mantenemos tabla de precios de terceros
+  // (el presupuesto x-budget-usd de estas rutas limita el gasto Claude, no esto).
+  recordAgentUsage(agentId, { inputTokens, outputTokens, provider: name }, req);
 }
 
 function providerHandler(name) {
@@ -809,14 +868,14 @@ function providerHandler(name) {
         }
         res.end();
         const m = tail.match(/"prompt_tokens"\s*:\s*(\d+)[\s\S]*?"completion_tokens"\s*:\s*(\d+)/);
-        meterProvider(name, agentId, m ? +m[1] : 0, m ? +m[2] : 0);
+        meterProvider(name, agentId, m ? +m[1] : 0, m ? +m[2] : 0, req);
       } else {
         res.setHeader('Content-Type', ct || 'application/json');
         const text = await upstream.text();
         res.send(text);
         let usage = null;
         try { usage = JSON.parse(text).usage; } catch (_) { /* no-JSON */ }
-        meterProvider(name, agentId, usage?.prompt_tokens || 0, usage?.completion_tokens || 0);
+        meterProvider(name, agentId, usage?.prompt_tokens || 0, usage?.completion_tokens || 0, req);
       }
     } catch (err) {
       if (controller.signal.aborted) { try { res.end(); } catch (_) {} return; }
@@ -917,6 +976,7 @@ if (require.main === module) {
 ║   Modelos: Fable 5, Haiku, Sonnet, Opus              ║
 ║                                                      ║
 ║   POST /v1/messages     → Proxy (streaming + no-stream)
+║   POST /v1/messages/count_tokens → Conteo real de tokens
 ║   POST /v1/batch        → Batch manual               ║
 ║   POST /v1/batch/auto   → Batch automático           ║
 ║   GET  /stats /health   → Métricas / healthcheck     ║

@@ -16,3 +16,6 @@ npm-debug.log*
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Auditoria de seguridad
+audit/

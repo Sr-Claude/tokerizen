@@ -4,7 +4,7 @@
 
 Reduce el consumo de tokens aplicando varias técnicas de optimización de forma transparente, sin modificar tu código cliente. **Soporta streaming (SSE)**, por lo que funciona con Claude Code y Cline, y **reenvía la API key del cliente**.
 
-> **Nota:** CORS está abierto (*) y los endpoints de métricas no llevan autenticación — es lo correcto para uso local con Claude Code/Cline, pero si lo vas a exponer en un dominio público, restringe el origen y ponlo detrás de un reverse proxy con auth.
+> **Nota:** por defecto el servidor solo escucha en `127.0.0.1`, CORS solo acepta orígenes locales y los endpoints de métricas no llevan autenticación — es lo correcto para uso local con Claude Code/Cline. Si vas a exponerlo en red (`HOST=0.0.0.0`), define `PROXY_SECRET` y pon los endpoints de métricas detrás de un reverse proxy con auth.
 
 ---
 
@@ -32,8 +32,10 @@ Este README cubre instalación, configuración, endpoints y operación básica.
 | **Batch de Tareas** | Fusiona hasta 8 prompts independientes en una llamada (manual + automático) | ✅ Activo |
 | **Saneamiento por modelo** | Elimina automáticamente parámetros que la API rechazaría con 400 según el modelo: `thinking: disabled` en Fable 5, `temperature`/`top_p`/`top_k` en Fable 5 / Opus 4.7+/ Sonnet 5, prefill en la familia 4.6+ | ✅ Activo |
 | **Atribución por agente + presupuestos** | Etiqueta cada petición con `x-agent-id` (worktrees de Orca, sub-agentes…) y acumula gasto/ahorro por etiqueta; `x-budget-usd` corta con `402` cuando el gasto acumulado supera el presupuesto | ✅ Activo (etiquetado opcional) |
+| **Aviso temprano de presupuesto** | Dispara un webhook (`x-budget-webhook` o `BUDGET_ALERT_WEBHOOK_URL`) una sola vez cuando el gasto de un agente cruza el 80% de su `x-budget-usd` (configurable), antes de llegar al corte de `402` | ⚙️ Opt-in (requiere `x-budget-usd` + webhook) |
 | **Caché de respuestas** | Respuestas completas cacheadas para peticiones idempotentes repetidas (fan-out de varios agentes leyendo lo mismo); aislada por API key, TTL 5 min | ⚙️ Opt-in (`x-cache-response`) |
 | **Passthrough multiproveedor** | Reenvía tráfico OpenAI/xAI tal cual (sin optimizar) pero **midiendo** peticiones y tokens por proveedor y por agente: un único plano de observabilidad para toda la flota | ✅ Activo (`/openai/v1`, `/xai/v1`) |
+| **Conteo real de tokens** | `POST /v1/messages/count_tokens` — passthrough al endpoint de conteo de Anthropic (gratuito), para medir el tamaño real de un prompt antes de comprimirlo o dividirlo en batch | ✅ Activo |
 | **Tool Schema Pruning** | Elimina herramientas no mencionadas en el prompt | ⚙️ Opt-in (`x-tool-pruning`) |
 | **Anti-preamble** | Fuerza salida directa y `[FIN]` como stop sequence | ⚙️ Opt-in (`x-anti-preamble`) |
 
@@ -88,6 +90,8 @@ El proxy estará escuchando en `http://localhost:8080`.
 | `RATE_LIMIT_MAX` | Máx. peticiones por API key/ventana | `120` |
 | `RESPONSE_CACHE_TTL_MS` | TTL de la caché de respuestas (`x-cache-response`) | `300000` |
 | `RESPONSE_CACHE_MAX` | Máx. entradas de la caché de respuestas | `500` |
+| `BUDGET_ALERT_WEBHOOK_URL` | Webhook global para el aviso temprano de presupuesto (fallback si la petición no envía `x-budget-webhook`) | — |
+| `BUDGET_ALERT_THRESHOLD_PCT` | Fracción de `x-budget-usd` a la que se dispara el aviso (0–1 exclusivo) | `0.8` |
 | `OPENAI_UPSTREAM` | Upstream del passthrough OpenAI | `https://api.openai.com` |
 | `XAI_UPSTREAM` | Upstream del passthrough xAI | `https://api.x.ai` |
 | `OPENAI_API_KEY` / `XAI_API_KEY` | Keys de respaldo para el passthrough (si el cliente no envía `Authorization`) | — |
@@ -163,6 +167,7 @@ curl -X POST http://localhost:8080/v1/messages \
 | `x-anti-preamble` | `true` para forzar salida directa + stop `[FIN]` (opt-in). **Se ignora si la petición lleva `tools`**, porque el stop `[FIN]` podría cortar una cadena de `tool_use` a medias |
 | `x-agent-id` | Etiqueta libre (máx. 120 chars) que agrupa gasto/ahorro por agente o worktree. Aparece en `/stats.agents` y en el dashboard |
 | `x-budget-usd` | Tope de gasto acumulado (USD) para el `x-agent-id` de la petición. Si ya se superó, responde `402 budget_exceeded` **sin llamar a Anthropic**. Requiere `x-agent-id`. El chequeo es previo, no transaccional: peticiones concurrentes pueden excederlo ligeramente |
+| `x-budget-webhook` | URL a la que se hace `POST` (fire-and-forget) la **primera vez** que el gasto del agente cruza el 80% de `x-budget-usd` (umbral configurable con `BUDGET_ALERT_THRESHOLD_PCT`). Requiere `x-budget-usd` + `x-agent-id`. Alternativa global: `BUDGET_ALERT_WEBHOOK_URL` |
 | `x-cache-response` | `read-only` para activar la caché de respuestas en esta petición (solo no-stream). Úsala **solo en lecturas idempotentes** ("lee X y resume"), nunca para generación de código. Solo se cachean terminaciones limpias (`end_turn`/`stop_sequence`) |
 
 **Cabeceras de respuesta:**
@@ -172,6 +177,39 @@ curl -X POST http://localhost:8080/v1/messages \
 | `x-compressed` | `true` si se aplicó compresión de historial |
 | `x-conversation-id` | ID con el que se cacheó el resumen |
 | `x-response-cache` | `hit` (respuesta servida desde la caché, sin llamar a Anthropic) o `stored` (respuesta guardada para próximas peticiones idénticas) |
+
+**Payload del webhook de presupuesto (`x-budget-webhook`):**
+
+```json
+{
+  "agent_id": "worktree-1",
+  "spent_usd": 8.42,
+  "budget_usd": 10,
+  "threshold_pct": 80,
+  "percent_used": 84,
+  "message": "Agente \"worktree-1\" ha consumido el 84% de su presupuesto ($8.42 de $10)."
+}
+```
+
+---
+
+### `POST /v1/messages/count_tokens`
+
+Passthrough directo al conteo de tokens de Anthropic (`/v1/messages/count_tokens`), que **no tiene coste**. Da el tamaño real del prompt (no la estimación heurística `length/3.5` que usa el proxy internamente para métricas de ahorro), útil para decidir si conviene comprimir, podar tools o dividir en batch antes de gastar en una llamada real.
+
+```bash
+curl -X POST http://localhost:8080/v1/messages/count_tokens \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: sk-ant-..." \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{"role": "user", "content": "Explica la relatividad en 2 frases"}]
+  }'
+```
+
+```json
+{ "input_tokens": 14 }
+```
 
 ---
 
@@ -439,8 +477,11 @@ Basado en pruebas internas con conversaciones de desarrollo típicas (50–100 t
 - **Caché de respuestas (`x-cache-response: read-only`):** cachea la respuesta completa de peticiones idempotentes repetidas — el caso real de ahorro en un fan-out donde N agentes piden la misma lectura. Aislada por API key, clave por hash normalizado de la petición (independiente del orden de claves JSON), TTL 5 min, solo `end_turn`/`stop_sequence`, solo no-stream. Un hit ahorra la llamada entera y se contabiliza como ahorro real.
 - **Passthrough multiproveedor (`/openai/v1/*`, `/xai/v1/*`):** reenvío transparente a OpenAI/xAI con medición de peticiones y tokens por proveedor y por agente (streaming incluido). Un solo dashboard para toda la flota. Errores de upstream → `502 upstream_error`.
 - **Gasto real (`totalSpentUSD`):** además del ahorro, ahora se estima el gasto Claude de cada respuesta (entrada + caché leída×0.1 + caché escrita×1.25 + salida, por precios de familia) — visible en el dashboard.
-- Nuevas variables: `RESPONSE_CACHE_TTL_MS`, `RESPONSE_CACHE_MAX`, `OPENAI_UPSTREAM`, `XAI_UPSTREAM`, `OPENAI_API_KEY`, `XAI_API_KEY`.
-- 12 tests nuevos (63 en total): atribución, presupuestos, caché de respuestas (hit/aislamiento por key), passthrough con upstream mockeado y manejo de upstream caído.
+- **Aviso temprano de presupuesto (`x-budget-webhook`):** webhook opcional que se dispara **una sola vez** cuando el gasto de un agente cruza el 80% de su `x-budget-usd` (umbral configurable con `BUDGET_ALERT_THRESHOLD_PCT`), antes de que llegue al corte de `402`. Fire-and-forget: un webhook caído no afecta la respuesta al cliente. Alternativa global sin cabecera por petición: `BUDGET_ALERT_WEBHOOK_URL`.
+- **Conteo real de tokens (`POST /v1/messages/count_tokens`):** passthrough al endpoint gratuito de Anthropic para medir el tamaño real de un prompt (reemplaza la heurística `length/3.5` cuando se necesita precisión antes de decidir comprimir o batchear).
+- **Endurecimiento tras auditoría interna:** `PROXY_SECRET` + `x-proxy-secret` para proteger el fallback a las keys del servidor, bind a `127.0.0.1` por defecto (`HOST`), CORS restringido a orígenes locales + `CORS_ALLOWED`, alineación por índice en `/v1/batch` (una tarea omitida ya no desplaza las respuestas de las siguientes), TTL absoluto en la caché de respuestas, `CACHE_FILE=''` para desactivar la persistencia y `JSON_LIMIT` configurable.
+- Nuevas variables: `RESPONSE_CACHE_TTL_MS`, `RESPONSE_CACHE_MAX`, `OPENAI_UPSTREAM`, `XAI_UPSTREAM`, `OPENAI_API_KEY`, `XAI_API_KEY`, `HOST`, `PROXY_SECRET`, `JSON_LIMIT`, `CORS_ALLOWED`, `BUDGET_ALERT_WEBHOOK_URL`, `BUDGET_ALERT_THRESHOLD_PCT`.
+- 16 tests nuevos (67 en total): atribución, presupuestos, aviso de presupuesto por webhook, caché de respuestas (hit/aislamiento por key), passthrough con upstream mockeado, manejo de upstream caído, CORS, `PROXY_SECRET` y `count_tokens`.
 
 ### v3.3.0 (2026-07-02)
 
